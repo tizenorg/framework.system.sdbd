@@ -33,6 +33,7 @@
 #include "sdb.h"
 #include "file_sync_service.h"
 #include "sdktools.h"
+#include "utils.h"
 
 #define SYNC_TIMEOUT 15
 
@@ -211,7 +212,7 @@ static int do_list(int s, const char *path)
             continue;
         }
 
-        strcpy(fname, de->d_name);
+        s_strncpy(fname, de->d_name, sizeof tmp);
         if(lstat(tmp, &st) == 0) {
             msg.dent.mode = htoll(st.st_mode);
             msg.dent.size = htoll(st.st_size);
@@ -270,18 +271,21 @@ static void sync_mediadb(char *path) {
         D("%s: command not found\n", CMD_MEDIADB_UPDATE);
         return;
     }
-    char cmd[256] = {0,};
+
     if (strstr(path, MEDIA_CONTENTS_PATH1) != NULL) {
-        snprintf(cmd, sizeof cmd, "%s -r %s", CMD_MEDIADB_UPDATE, MEDIA_CONTENTS_PATH1);
-        system(cmd);
+        char *arg_list[] = {CMD_MEDIADB_UPDATE, "r", MEDIA_CONTENTS_PATH1, NULL};
+
+        spawn(CMD_MEDIADB_UPDATE, arg_list);
         D("media db update done to %s\n", MEDIA_CONTENTS_PATH1);
     } else if (strstr(path, MEDIA_CONTENTS_PATH2) != NULL) {
-        snprintf(cmd, sizeof cmd, "%s -r %s", CMD_MEDIADB_UPDATE, MEDIA_CONTENTS_PATH2);
-        system(cmd);
+        char *arg_list[] = {CMD_MEDIADB_UPDATE, "r", MEDIA_CONTENTS_PATH2, NULL};
+
+        spawn(CMD_MEDIADB_UPDATE, arg_list);
         D("media db update done to %s\n", MEDIA_CONTENTS_PATH2);
     } else if (strstr(path, MEDIA_CONTENTS_PATH3) != NULL) {
-        snprintf(cmd, sizeof cmd, "%s -r %s", CMD_MEDIADB_UPDATE, MEDIA_CONTENTS_PATH3);
-        system(cmd);
+        char *arg_list[] = {CMD_MEDIADB_UPDATE, "r", MEDIA_CONTENTS_PATH3, NULL};
+
+        spawn(CMD_MEDIADB_UPDATE, arg_list);
         D("media db update done to %s\n", MEDIA_CONTENTS_PATH3);
     }
     return;
@@ -559,9 +563,6 @@ void file_sync_service(int fd, void *cookie)
     FD_ZERO(&set); /* clear the set */
     FD_SET(fd, &set); /* add our file descriptor to the set */
 
-    timeout.tv_sec = SYNC_TIMEOUT;
-    timeout.tv_usec = 0;
-
     pid_t pid = fork();
 
     if (pid == 0) {
@@ -572,6 +573,10 @@ void file_sync_service(int fd, void *cookie)
         for(;;) {
             D("sync: waiting for command for %d sec\n", SYNC_TIMEOUT);
 
+            // in Linux, timeout would be altered after each select() call.
+            // Therefore, re-initialization is needed.
+            timeout.tv_sec = SYNC_TIMEOUT;
+            timeout.tv_usec = 0;
             rv = select(fd + 1, &set, NULL, NULL, &timeout);
             if (rv == -1) {
                 D("sync file descriptor select failed\n");

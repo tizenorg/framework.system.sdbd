@@ -1,7 +1,6 @@
 Name:       sdbd
-Version:    2.2.16
-Release:    0
-VCS:        framework/system/sdbd#submit/tizen_2.2/20130621.075403-19-g58620683604f7e5cc268f404b8d05d7e653b145c
+Version:    2.2.22
+Release:    1
 License:    Apache-2.0
 Summary:    SDB daemon
 Group:      System/Utilities
@@ -12,10 +11,6 @@ Source1002:    sdbd_emulator.service
 BuildRequires: capi-system-info-devel
 BuildRequires: vconf-devel
 BuildRequires: smack-devel
-Requires(post): pkgmgr
-Requires(post): pkgmgr-server
-Requires(post): wrt
-Requires(post): aul
 Requires: default-files-tizen
 Requires: sys-assert
 Requires: debug-launchpad
@@ -47,6 +42,9 @@ install -m 0644 %SOURCE1001 %{buildroot}%{_libdir}/systemd/system/sdbd.service
 mkdir -p %{buildroot}%{_prefix}/sbin
 install -m 755 script/sdk_launch %{buildroot}%{_prefix}/sbin/
 
+mkdir -p %{buildroot}/usr/bin
+install -m 755 script/profile_command %{buildroot}/usr/bin/
+
 %post
 chsmack -a sdbd::home /home/developer
 chsmack -t /home/developer
@@ -61,6 +59,7 @@ chsmack -t /home/developer
 %{_libdir}/systemd/system/emulator.target.wants/sdbd.service
 %endif
 /usr/share/license/%{name}
+/usr/bin/profile_command
 
 %changelog
 
