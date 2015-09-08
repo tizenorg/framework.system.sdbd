@@ -1,14 +1,14 @@
 /*
- * Copyright (C) 2007 The Android Open Source Project
+ * Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the License);
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
+ * distributed under the License is distributed on an AS IS BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -25,32 +25,62 @@
 #include <time.h>
 #include <sys/time.h>
 #include <signal.h>
+#include <grp.h>
+#include <pthread.h>
 
 #include "sysdeps.h"
 #include "sdb.h"
+#include "strutils.h"
+#include "utils.h"
 
 #if !SDB_HOST
-//#include <private/android_filesystem_config.h> eric
-#include <linux/capability.h>
 #include <linux/prctl.h>
-#define SDB_PIDPATH "/var/run/sdbd.pid"
+#define SDB_PIDPATH "/tmp/.sdbd.pid"
 #else
 #include "usb_vendors.h"
 #endif
+#include <system_info_internal.h>
+#include <vconf.h>
+#include "utils.h"
 
+#define PROC_CMDLINE_PATH "/proc/cmdline"
+#define USB_SERIAL_PATH "/sys/class/usb_mode/usb0/iSerial"
+
+#if SDB_TRACE
+SDB_MUTEX_DEFINE( D_lock );
+#endif
 
 int HOST = 0;
+
+int is_emulator(void) {
+    if (access(USB_NODE_FILE, F_OK) == 0) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
 
 void handle_sig_term(int sig) {
 #ifdef SDB_PIDPATH
     if (access(SDB_PIDPATH, F_OK) == 0)
-    	sdb_unlink(SDB_PIDPATH);
+        sdb_unlink(SDB_PIDPATH);
 #endif
-    if (access("/dev/samsung_sdb", F_OK) == 0) {
-        exit(0);
+    char *cmd1_args[] = {"/usr/bin/killall", "/usr/bin/debug_launchpad_preloading_preinitializing_daemon", NULL};
+
+    if (!is_emulator()) {
+        int val = 0;
+        if (vconf_get_int(DEBUG_MODE_KEY, &val)) {
+            D("Failed to get debug mode\n");
+        } else {
+            if (usb_mode != 6 && val == 6) { // set mtp mode by default!.
+                vconf_set_int(DEBUG_MODE_KEY, 2);
+            }
+        }
     } else {
-    	// do nothing on a emulator
+        // do nothing on a emulator
     }
+    spawn("/usr/bin/killall", cmd1_args);
+    sdb_sleep_ms(1000);
 }
 
 static const char *sdb_device_banner = "device";
@@ -70,7 +100,7 @@ void fatal_errno(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "error: %s: ", strerror(errno));
+    fprintf(stderr, "error: (errno:%d): ", errno);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
@@ -104,6 +134,9 @@ void  sdb_trace_init(void)
         { "sysdeps", TRACE_SYSDEPS },
         { "transport", TRACE_TRANSPORT },
         { "jdwp", TRACE_JDWP },
+        { "services", TRACE_SERVICES },
+        { "properties", TRACE_PROPERTIES },
+        { "sdktools", TRACE_SDKTOOLS },
         { NULL, 0 }
     };
 
@@ -141,6 +174,60 @@ void  sdb_trace_init(void)
     }
 }
 
+#if !SDB_HOST
+/*
+ * Implements SDB tracing inside the emulator.
+ */
+
+#include <stdarg.h>
+
+/*
+ * Redefine open and write for qemu_pipe.h that contains inlined references
+ * to those routines. We will redifine them back after qemu_pipe.h inclusion.
+ */
+
+#undef open
+#undef write
+#define open    sdb_open
+#define write   sdb_write
+#include "qemu_pipe.h"
+#undef open
+#undef write
+#define open    ___xxx_open
+#define write   ___xxx_write
+
+/* A handle to sdb-debug qemud service in the emulator. */
+int   sdb_debug_qemu = -1;
+
+/* Initializes connection with the sdb-debug qemud service in the emulator. */
+#if 0 /* doen't support in Tizen */
+static int sdb_qemu_trace_init(void)
+{
+    char con_name[32];
+
+    if (sdb_debug_qemu >= 0) {
+        return 0;
+    }
+
+    /* sdb debugging QEMUD service connection request. */
+    snprintf(con_name, sizeof(con_name), "qemud:sdb-debug");
+    sdb_debug_qemu = qemu_pipe_open(con_name);
+    return (sdb_debug_qemu >= 0) ? 0 : -1;
+}
+
+void sdb_qemu_trace(const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char msg[1024];
+
+    if (sdb_debug_qemu >= 0) {
+        vsnprintf(msg, sizeof(msg), fmt, args);
+        sdb_write(sdb_debug_qemu, msg, strlen(msg));
+    }
+}
+#endif
+#endif  /* !SDB_HOST */
 
 apacket *get_apacket(void)
 {
@@ -152,7 +239,10 @@ apacket *get_apacket(void)
 
 void put_apacket(apacket *p)
 {
-    free(p);
+    if (p != NULL) {
+        free(p);
+        p = NULL;
+    }
 }
 
 void handle_online(void)
@@ -234,15 +324,50 @@ static void send_connect(atransport *t)
     cp->msg.command = A_CNXN;
     cp->msg.arg0 = A_VERSION;
     cp->msg.arg1 = MAX_PAYLOAD;
-    snprintf((char*) cp->data, sizeof cp->data, "%s::",
-            HOST ? "host" : sdb_device_banner);
+
+    char device_name[256]={0,};
+    int r = 0;
+    int status = 0;
+    if (is_pwlocked()) {
+        status = 1;
+        t->connection_state = CS_PWLOCK;
+    }
+
+    if (is_emulator()) {
+        r = get_emulator_name(device_name, sizeof device_name);
+    } else {
+        r = get_device_name(device_name, sizeof device_name);
+    }
+    if (r < 0) {
+        snprintf((char*) cp->data, sizeof cp->data, "%s::%s::%d", sdb_device_banner, DEFAULT_DEVICENAME, status);
+    } else {
+        snprintf((char*) cp->data, sizeof cp->data, "%s::%s::%d", sdb_device_banner, device_name, status);
+    }
+
+    D("CNXN data:%s\n", (char*)cp->data);
     cp->msg.data_length = strlen((char*) cp->data) + 1;
+
     send_packet(cp, t);
 #if SDB_HOST
         /* XXX why sleep here? */
     // allow the device some time to respond to the connect message
     sdb_sleep_ms(1000);
 #endif
+}
+
+static void send_device_status()
+{
+    D("broadcast device status\n");
+    apacket* cp = get_apacket();
+    cp->msg.command = A_STAT;
+    cp->msg.arg0 = is_pwlocked();
+    cp->msg.arg1 = 0;
+
+    broadcast_transport(cp);
+
+    //all broadcasted packets are memory copied
+    //so, we should call put_apacket
+    put_apacket(cp);
 }
 
 static char *connection_state_name(atransport *t)
@@ -261,6 +386,105 @@ static char *connection_state_name(atransport *t)
     default:
         return "unknown";
     }
+}
+
+static int get_str_cmdline(char *src, char *dest, char str[], int str_size) {
+    char *s = strstr(src, dest);
+    if (s == NULL) {
+        return -1;
+    }
+    char *e = strstr(s, " ");
+    if (e == NULL) {
+        return -1;
+    }
+
+    int len = e-s-strlen(dest);
+
+    if (len >= str_size) {
+        D("buffer size(%d) should be bigger than %d\n", str_size, len+1);
+        return -1;
+    }
+
+    strncpy(str, s + strlen(dest), len);
+    str[len]='\0';
+    return len;
+}
+
+int get_emulator_forward_port() {
+    char cmdline[512];
+    int fd = unix_open(PROC_CMDLINE_PATH, O_RDONLY);
+    char *port_str = "sdb_port=";
+    char port_buf[128]={0,};
+    int port = -1;
+
+    if (fd < 0) {
+        return -1;
+    }
+    if(read_line(fd, cmdline, sizeof(cmdline))) {
+        D("qemu cmd: %s\n", cmdline);
+        if (get_str_cmdline(cmdline, port_str, port_buf, sizeof(port_buf)) < 1) {
+            D("could not get port from cmdline\n");
+            sdb_close(fd);
+            return -1;
+        }
+        // FIXME: remove comma!
+        port_buf[strlen(port_buf)-1]='\0';
+        port = strtol(port_buf, NULL, 10);
+    }
+    sdb_close(fd);
+    return port;
+}
+
+int get_emulator_name(char str[], int str_size) {
+    char cmdline[512];
+    int fd = unix_open(PROC_CMDLINE_PATH, O_RDONLY);
+    char *name_str = "vm_name=";
+
+    if (fd < 0) {
+        D("fail to read /proc/cmdline\n");
+        return -1;
+    }
+    if(read_line(fd, cmdline, sizeof(cmdline))) {
+        D("qemu cmd: %s\n", cmdline);
+        if (get_str_cmdline(cmdline, name_str, str, str_size) < 1) {
+            D("could not get emulator name from cmdline\n");
+            sdb_close(fd);
+            return -1;
+        }
+    }
+    sdb_close(fd);
+    return 0;
+}
+
+int get_device_name(char str[], int str_size) {
+    char *value = NULL;
+    int r = system_info_get_value_string(SYSTEM_INFO_KEY_MODEL, &value);
+    if (r != SYSTEM_INFO_ERROR_NONE) {
+        D("fail to get system model:%d\n", errno);
+        return -1;
+    } else {
+        s_strncpy(str, value, str_size);
+        D("returns model_name:%s\n", value);
+        if (value != NULL) {
+            free(value);
+        }
+        return 0;
+    }
+    /*
+    int fd = unix_open(USB_SERIAL_PATH, O_RDONLY);
+    if (fd < 0) {
+        D("fail to read:%s (%d)\n", USB_SERIAL_PATH, errno);
+        return -1;
+    }
+
+    if(read_line(fd, str, str_size)) {
+        D("device serial name: %s\n", str);
+        sdb_close(fd);
+        return 0;
+    }
+    sdb_close(fd);
+    */
+    return -1;
 }
 
 void parse_banner(char *banner, atransport *t)
@@ -309,6 +533,13 @@ void parse_banner(char *banner, atransport *t)
         return;
     }
 
+    if(!strcmp(type, "sideload")) {
+        D("setting connection_state to CS_SIDELOAD\n");
+        t->connection_state = CS_SIDELOAD;
+        update_transports();
+        return;
+    }
+
     t->connection_state = CS_HOST;
 }
 
@@ -316,7 +547,10 @@ void handle_packet(apacket *p, atransport *t)
 {
     asocket *s;
 
-    D("handle_packet() %d\n", p->msg.command);
+    D("handle_packet() %c%c%c%c\n", ((char*) (&(p->msg.command)))[0],
+                ((char*) (&(p->msg.command)))[1],
+                ((char*) (&(p->msg.command)))[2],
+                ((char*) (&(p->msg.command)))[3]);
 
     print_packet("recv", p);
 
@@ -344,17 +578,22 @@ void handle_packet(apacket *p, atransport *t)
         break;
 
     case A_OPEN: /* OPEN(local-id, 0, "destination") */
-        if(t->connection_state != CS_OFFLINE) {
-            char *name = (char*) p->data;
-            name[p->msg.data_length > 0 ? p->msg.data_length - 1 : 0] = 0;
-            s = create_local_service_socket(name);
-            if(s == 0) {
-                send_close(0, p->msg.arg0, t);
-            } else {
-                s->peer = create_remote_socket(p->msg.arg0, t);
-                s->peer->peer = s;
-                send_ready(s->id, s->peer->id, t);
-                s->ready(s);
+        if (is_pwlocked() && t->connection_state == CS_PWLOCK) { // in case of already locked before get A_CNXN
+            D("open failed due to password locked before get A_CNXN:%d\n", t->connection_state);
+            send_close(0, p->msg.arg0, t);
+        } else {
+            if(t->connection_state != CS_OFFLINE) {
+                char *name = (char*) p->data;
+                name[p->msg.data_length > 0 ? p->msg.data_length - 1 : 0] = 0;
+                s = create_local_service_socket(name);
+                if(s == 0) {
+                    send_close(0, p->msg.arg0, t);
+                } else {
+                    s->peer = create_remote_socket(p->msg.arg0, t);
+                    s->peer->peer = s;
+                    send_ready(s->id, s->peer->id, t);
+                    s->ready(s);
+                }
             }
         }
         break;
@@ -419,7 +658,9 @@ static void ss_listener_event_func(int _fd, unsigned ev, void *_l)
         fd = sdb_socket_accept(_fd, &addr, &alen);
         if(fd < 0) return;
 
-        sdb_socket_setbufsize(fd, CHUNK_SIZE);
+        if (sdb_socket_setbufsize(fd, CHUNK_SIZE) == -1) {
+            D("failed to set buffer size of sdb socket: (errno:%d)\n", errno);
+        }
 
         s = create_local_socket(fd);
         if(s) {
@@ -577,7 +818,9 @@ static int install_listener(const char *local_name, const char *connect_to, atra
         return -2;
     }
 
-    close_on_exec(l->fd);
+    if (close_on_exec(l->fd) < 0) {
+        D("fail to close fd exec:%d\n",l->fd);
+    }
     if(!strcmp(l->connect_to, "*smartsocket*")) {
         fdevent_install(&l->fde, l->fd, ss_listener_event_func, l);
     } else {
@@ -602,14 +845,6 @@ nomem:
     fatal("cannot allocate listener");
     return 0;
 }
-
-#ifdef HAVE_FORKEXEC
-static void sigchld_handler(int n)
-{
-    int status;
-    while(waitpid(-1, &status, WNOHANG) > 0) ;
-}
-#endif
 
 #ifdef HAVE_WIN32_PROC
 static BOOL WINAPI ctrlc_handler(DWORD type)
@@ -652,14 +887,24 @@ void start_logging(void)
     int fd;
 
     fd = unix_open("/dev/null", O_RDONLY);
+    if (fd < 0) {
+        // hopefully not gonna happen
+        return;
+    }
     dup2(fd, 0);
+    sdb_close(fd);
 
     fd = unix_open("/tmp/sdb.log", O_WRONLY | O_CREAT | O_APPEND, 0640);
     if(fd < 0) {
         fd = unix_open("/dev/null", O_WRONLY);
+        if (fd < 0) {
+            // hopefully not gonna happen
+            return;
+        }
     }
     dup2(fd, 1);
     dup2(fd, 2);
+    sdb_close(fd);
     fprintf(stderr,"--- sdb starting (pid %d) ---\n", getpid());
 #endif
 }
@@ -671,28 +916,43 @@ void start_device_log(void)
     char    path[PATH_MAX];
     struct tm now;
     time_t t;
-    const char*  p = getenv("SDB_TRACE");
+//    char value[PROPERTY_VALUE_MAX];
+    const char* p = getenv("SDB_TRACE");
+    // read the trace mask from persistent property persist.sdb.trace_mask
+    // give up if the property is not set or cannot be parsed
+#if 0 /* tizen specific */
+    property_get("persist.sdb.trace_mask", value, "");
+    if (sscanf(value, "%x", &sdb_trace_mask) != 1)
+        return;
+#endif
 
-    if (p == NULL)
-    	return;
-
+    if (p == NULL) {
+        return;
+    }
     tzset();
     time(&t);
     localtime_r(&t, &now);
     strftime(path, sizeof(path),
-                "/tmp/sdb-%Y-%m-%d-%H-%M-%S.txt",
+                "/tmp/sdbd-%Y-%m-%d-%H-%M-%S.txt",
                 &now);
     fd = unix_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0640);
-    if (fd < 0)
+    if (fd < 0) {
         return;
+    }
 
     // redirect stdout and stderr to the log file
     dup2(fd, 1);
     dup2(fd, 2);
-    fprintf(stderr,"--- sdb starting (pid %d) ---\n", getpid());
+    fprintf(stderr,"--- sdbd starting (pid %d) ---\n", getpid());
+    sdb_close(fd);
 
     fd = unix_open("/dev/null", O_RDONLY);
+    if (fd < 0) {
+        // hopefully not gonna happen
+        return;
+    }
     dup2(fd, 0);
+    sdb_close(fd);
 }
 
 int daemonize(void) {
@@ -708,21 +968,20 @@ int daemonize(void) {
     default:
         _exit(0);
     }
+#ifdef SDB_PIDPATH
+    FILE *f = fopen(SDB_PIDPATH, "w");
 
+    if (f != NULL) {
+        fprintf(f, "%d\n", getpid());
+        fclose(f);
+    }
+#endif
     if (setsid() == -1)
         return -1;
 
     if (chdir("/") < 0)
         D("sdbd: unable to change working directory to /\n");
 
-#ifdef SDB_PIDPATH
-    FILE *f = fopen(SDB_PIDPATH, "w");
-
-    if (f != NULL) {
-        fprintf(f, "%ld\n", (long) getpid());
-        fclose(f);
-    }
-#endif
     return 0;
 }
 #endif
@@ -844,9 +1103,10 @@ int launch_server(int server_port)
         // wait for the "OK\n" message
         sdb_close(fd[1]);
         int ret = sdb_read(fd[0], temp, 3);
+        int saved_errno = errno;
         sdb_close(fd[0]);
         if (ret < 0) {
-            fprintf(stderr, "could not read ok from SDB Server, errno = %d\n", errno);
+            fprintf(stderr, "could not read ok from SDB Server, errno = %d\n", saved_errno);
             return -1;
         }
         if (ret != 3 || temp[0] != 'O' || temp[1] != 'K' || temp[2] != '\n') {
@@ -873,19 +1133,140 @@ void build_local_name(char* target_str, size_t target_size, int server_port)
   snprintf(target_str, target_size, "tcp:%d", server_port);
 }
 
+#if !SDB_HOST
+static void init_drop_privileges() {
+#ifdef _DROP_PRIVILEGE
+    rootshell_mode = 0;
+#else
+    rootshell_mode = 1;
+#endif
+}
+
+int is_pwlocked(void) {
+    int pwlock_status = 0;
+    int pwlock_type = 0;
+
+    if (vconf_get_int(VCONFKEY_IDLE_LOCK_STATE, &pwlock_status)) {
+        pwlock_status = 0;
+        D("failed to get pw lock status\n");
+    }
+    if (vconf_get_int(VCONFKEY_SETAPPL_SCREEN_LOCK_TYPE_INT, &pwlock_type)) {
+        pwlock_type = 0;
+        D("failed to get pw lock type\n");
+    }
+    if (pwlock_status == VCONFKEY_IDLE_LOCK && (pwlock_type == SETTING_SCREEN_LOCK_TYPE_SIMPLE_PASSWORD || pwlock_type == SETTING_SCREEN_LOCK_TYPE_PASSWORD)) {
+        D("device has been locked\n");
+        return 1; // locked!
+    }
+
+    return 0; // unlocked!
+}
+
+int should_drop_privileges() {
+    if (rootshell_mode == 1) { // if root, then don't drop
+        return 0;
+    }
+    return 1;
+}
+
+static void *pwlock_tmp_cb(void *x)
+{
+    int status = is_pwlocked();
+    /**
+     * FIXME: make it callback using vconf_notify_key_changed
+     */
+
+    while(1) {
+        if (status != is_pwlocked()) {
+            send_device_status();
+            status = is_pwlocked();
+        }
+        sdb_sleep_ms(3000);
+    }
+    return 0;
+}
+
+void register_pwlock_cb() {
+    D("registerd vconf callback\n");
+
+    sdb_thread_t t;
+    if(sdb_thread_create( &t, pwlock_tmp_cb, NULL)){
+        D("cannot create service thread\n");
+        return;
+    }
+}
+
+int set_developer_privileges() {
+    gid_t groups[] = { SID_DEVELOPER, SID_APP_LOGGING, SID_SYS_LOGGING, SID_INPUT };
+    if (setgroups(sizeof(groups) / sizeof(groups[0]), groups) != 0) {
+        D("set groups failed (errno: %d, %s)\n", errno, strerror(errno));
+    }
+
+    // then switch user and group to developer
+    if (setgid(SID_DEVELOPER) != 0) {
+        D("set group id failed (errno: %d, %s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    if (setuid(SID_DEVELOPER) != 0) {
+        D("set user id failed (errno: %d)\n", errno);
+        return -1;
+    }
+
+    if (chdir("/home/developer") < 0) {
+        D("sdbd: unable to change working directory to /home/developer\n");
+    } else {
+        if (chdir("/") < 0) {
+            D("sdbd: unable to change working directory to /\n");
+        }
+    }
+    // TODO: use pam later
+    putenv("HOME=/home/developer");
+
+    return 1;
+}
+#define ONDEMAND_ROOT_PATH "/home/developer"
+
+static void execute_required_process() {
+    char *cmd_args[] = {"/usr/bin/debug_launchpad_preloading_preinitializing_daemon",NULL};
+
+    spawn("/usr/bin/debug_launchpad_preloading_preinitializing_daemon", cmd_args);
+}
+
+static void init_sdk_requirements() {
+    struct stat st;
+
+    // initialize usb mode
+    usb_mode = 0;
+
+    if (stat(ONDEMAND_ROOT_PATH, &st) == -1) {
+        return;
+    }
+    if (st.st_uid != SID_DEVELOPER || st.st_gid != SID_DEVELOPER) {
+        char *arg_list[] = {"/bin/chown", ONDEMAND_ROOT_PATH, "-R", NULL};
+
+        spawn("/bin/chown", arg_list);
+    }
+
+    execute_required_process();
+
+    register_pwlock_cb();
+}
+#endif /* !SDB_HOST */
+
 int sdb_main(int is_daemon, int server_port)
 {
-#if 0 //!SDB_HOST eric
-    int secure = 0;
-    int port;
-    char value[PROPERTY_VALUE_MAX];
+#if !SDB_HOST
+    init_drop_privileges();
+    init_sdk_requirements();
+    umask(000);
 #endif
 
     atexit(sdb_cleanup);
 #ifdef HAVE_WIN32_PROC
     SetConsoleCtrlHandler( ctrlc_handler, TRUE );
 #elif defined(HAVE_FORKEXEC)
-    signal(SIGCHLD, sigchld_handler);
+    // No SIGCHLD. Let the service subproc handle its children.
     signal(SIGPIPE, SIG_IGN);
 #endif
 
@@ -904,60 +1285,31 @@ int sdb_main(int is_daemon, int server_port)
         exit(1);
     }
 #else
-    /* run sdbd in secure mode if ro.secure is set and
-    ** we are not in the emulator
-    */
-#if 0 //eric
-    property_get("ro.kernel.qemu", value, "");
-    if (strcmp(value, "1") != 0) {
-        property_get("ro.secure", value, "");
-        if (strcmp(value, "1") == 0) {
-            // don't run as root if ro.secure is set...
-            secure = 1;
-
-            // ... except we allow running as root in userdebug builds if the 
-            // service.sdb.root property has been set by the "sdb root" command
-            property_get("ro.debuggable", value, "");
-            if (strcmp(value, "1") == 0) {
-                property_get("service.sdb.root", value, "");
-                if (strcmp(value, "1") == 0) {
-                    secure = 0;
-                }
-            }
-        }
-    }
-
     /* don't listen on a port (default 5037) if running in secure mode */
     /* don't run as root if we are running in secure mode */
-    if (secure) {
+
+    if (should_drop_privileges()) {
+# if 0
         struct __user_cap_header_struct header;
         struct __user_cap_data_struct cap;
 
         if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0) {
             exit(1);
         }
-
         /* add extra groups:
-        ** AID_SDB to access the USB driver
-        ** AID_LOG to read system logs (sdb logcat)
-        ** AID_INPUT to diagnose input issues (getevent)
-        ** AID_INET to diagnose network issues (netcfg, ping)
-        ** AID_GRAPHICS to access the frame buffer
-        ** AID_NET_BT and AID_NET_BT_ADMIN to diagnose bluetooth (hcidump)
-        ** AID_SDCARD_RW to allow writing to the SD card
-        ** AID_MOUNT to allow unmounting the SD card before rebooting
+        ** SID_TTY to access /dev/ptmx
         */
-        gid_t groups[] = { AID_SDB, AID_LOG, AID_INPUT, AID_INET, AID_GRAPHICS,
-                           AID_NET_BT, AID_NET_BT_ADMIN, AID_SDCARD_RW, AID_MOUNT };
+        gid_t groups[] = { SID_TTY, SID_APP_LOGGING, SID_SYS_LOGGING };
         if (setgroups(sizeof(groups)/sizeof(groups[0]), groups) != 0) {
             exit(1);
         }
-
-        /* then switch user and group to "shell" */
-        if (setgid(AID_SHELL) != 0) {
+        /* then switch user and group to "developer" */
+        if (setgid(SID_DEVELOPER) != 0) {
+            fprintf(stderr, "set group id failed errno: %d\n", errno);
             exit(1);
         }
-        if (setuid(AID_SHELL) != 0) {
+        if (setuid(SID_DEVELOPER) != 0) {
+            fprintf(stderr, "set user id failed errno: %d\n", errno);
             exit(1);
         }
 
@@ -967,40 +1319,33 @@ int sdb_main(int is_daemon, int server_port)
         cap.effective = cap.permitted = (1 << CAP_SYS_BOOT);
         cap.inheritable = 0;
         capset(&header, &cap);
-
+#endif
         D("Local port disabled\n");
     } else {
-#endif
         char local_name[30];
         build_local_name(local_name, sizeof(local_name), server_port);
         if(install_listener(local_name, "*smartsocket*", NULL)) {
-            exit(1);
+            D("Cannot install listener (smartsocket)\n");
+            return 1;
+            //exit(1);
         }
-#if 0 //eric
     }
-#endif
-        /* for the device, start the usb transport if the
-        ** android usb device exists and the "service.sdb.tcp.port" and
-        ** "persist.sdb.tcp.port" properties are not set.
-        ** Otherwise start the network transport.
-        */
-#if 0 //eric
-    property_get("service.sdb.tcp.port", value, "");
-    if (!value[0])
-        property_get("persist.sdb.tcp.port", value, "");
-    if (sscanf(value, "%d", &port) == 1 && port > 0) {
-        // listen on TCP port specified by service.sdb.tcp.port property
-        local_init(port);
-    } else
-#endif
-	if (access("/dev/samsung_sdb", F_OK) == 0) {
+
+    if (!is_emulator()) {
         // listen on USB
         usb_init();
+        // listen on tcp
+        //local_init(DEFAULT_SDB_LOCAL_TRANSPORT_PORT);
     } else {
         // listen on default port
         local_init(DEFAULT_SDB_LOCAL_TRANSPORT_PORT);
     }
+
+#if 0 /* tizen specific */
+    D("sdb_main(): pre init_jdwp()\n");
     init_jdwp();
+    D("sdb_main(): post init_jdwp()\n");
+#endif
 #endif
 
     if (is_daemon)
@@ -1014,6 +1359,8 @@ int sdb_main(int is_daemon, int server_port)
 #endif
         start_logging();
     }
+
+    D("Event loop starting\n");
 
     fdevent_loop();
 
@@ -1030,7 +1377,7 @@ void connect_device(char* host, char* buffer, int buffer_size)
     char hostbuf[100];
     char serial[100];
 
-    strncpy(hostbuf, host, sizeof(hostbuf) - 1);
+    s_strncpy(hostbuf, host, sizeof(hostbuf) - 1);
     if (portstr) {
         if (portstr - host >= sizeof(hostbuf)) {
             snprintf(buffer, buffer_size, "bad host name %s", host);
@@ -1054,14 +1401,14 @@ void connect_device(char* host, char* buffer, int buffer_size)
 
     fd = socket_network_client(hostbuf, port, SOCK_STREAM);
     if (fd < 0) {
-        snprintf(buffer, buffer_size, "unable to connect to %s:%d", host, port);
+        snprintf(buffer, buffer_size, "unable to connect to %s", host);
         return;
     }
 
     D("client: connected on remote on fd %d\n", fd);
     close_on_exec(fd);
     disable_tcp_nagle(fd);
-    register_socket_transport(fd, serial, port, 0);
+    register_socket_transport(fd, serial, port, 0, NULL);
     snprintf(buffer, buffer_size, "connected to %s", serial);
 }
 
@@ -1110,7 +1457,7 @@ void connect_emulator(char* port_spec, char* buffer, int buffer_size)
     }
 
     /* Preconditions met, try to connect to the emulator. */
-    if (!local_connect_arbitrary_ports(console_port, sdb_port)) {
+    if (!local_connect_arbitrary_ports(console_port, sdb_port, NULL)) {
         snprintf(buffer, buffer_size,
                 "Connected to emulator on ports %d,%d", console_port, sdb_port);
     } else {
@@ -1120,6 +1467,35 @@ void connect_emulator(char* port_spec, char* buffer, int buffer_size)
     }
 }
 #endif
+
+int copy_packet(apacket* dest, apacket* src) {
+
+    if(dest == NULL) {
+        D("dest packet is NULL\n");
+        return -1;
+    }
+
+    if(src == NULL) {
+        D("src packet is NULL\n");
+        return -1;
+    }
+
+    dest->next = src->next;
+    dest->ptr = src->ptr;
+    dest->len = src->len;
+
+    memcpy(&(dest->msg), &(src->msg), sizeof(amessage));
+    // TODO: should verify what if data length is over MAX_PAYLOAD
+    int data_length = src->msg.data_length;
+    if(data_length > MAX_PAYLOAD) {
+        data_length = MAX_PAYLOAD;
+        dest->msg.data_length = data_length;
+        D("copy packet error: %d > MAX_PAYLOAD\n", src->msg.data_length);
+    }
+
+    memcpy(&(dest->data), &(src->data), data_length);
+    return 0;
+}
 
 int handle_host_request(char *service, transport_type ttype, char* serial, int reply_fd, asocket *s)
 {
@@ -1151,7 +1527,7 @@ int handle_host_request(char *service, transport_type ttype, char* serial, int r
             type = kTransportAny;
         } else if (!strncmp(service, "transport:", strlen("transport:"))) {
             service += strlen("transport:");
-            serial = strdup(service);
+            serial = service;
         }
 
         transport = acquire_one_transport(CS_ANY, type, serial, &error_string);
@@ -1203,9 +1579,9 @@ int handle_host_request(char *service, transport_type ttype, char* serial, int r
             unregister_all_tcp_transports();
         } else {
             char hostbuf[100];
-            // assume port 5555 if no port is specified
+            // assume port 26101 if no port is specified
             if (!strchr(serial, ':')) {
-                snprintf(hostbuf, sizeof(hostbuf) - 1, "%s:5555", serial);
+                snprintf(hostbuf, sizeof(hostbuf) - 1, "%s:26101", serial);
                 serial = hostbuf;
             }
             atransport *t = find_transport(serial);
@@ -1242,10 +1618,20 @@ int handle_host_request(char *service, transport_type ttype, char* serial, int r
         return 0;
     }
     // indicates a new emulator instance has started
-    if (!strncmp(service,"emulator:",9)) {
-        int  port = atoi(service+9);
-        local_connect(port);
-        /* we don't even need to send a reply */
+       if (!strncmp(service,"emulator:",9)) { /* tizen specific */
+           char *tmp = strtok(service+9, DEVICEMAP_SEPARATOR);
+           int  port = 0;
+
+           if (tmp == NULL) {
+               port = atoi(service+9);
+           } else {
+               port = atoi(tmp);
+               tmp = strtok(NULL, DEVICEMAP_SEPARATOR);
+               if (tmp != NULL) {
+                   local_connect(port, tmp);
+               }
+           }
+           local_connect(port, NULL);
         return 0;
     }
 #endif // SDB_HOST
@@ -1311,23 +1697,31 @@ int recovery_mode = 0;
 
 int main(int argc, char **argv)
 {
-    sdb_trace_init();
+    sdb_trace_init(); /* tizen specific */
 #if SDB_HOST
     sdb_sysdeps_init();
+    sdb_trace_init();
     return sdb_commandline(argc - 1, argv + 1);
 #else
+    /* If sdbd runs inside the emulator this will enable sdb tracing via
+     * sdb-debug qemud service in the emulator. */
+#if 0 /* tizen specific */
+    sdb_qemu_trace_init();
     if((argc > 1) && (!strcmp(argv[1],"recovery"))) {
         sdb_device_banner = "recovery";
         recovery_mode = 1;
     }
-
-    //sdbd will never die on emulator!
-    signal(SIGTERM, handle_sig_term);
+#endif
 #if !SDB_HOST
     if (daemonize() < 0)
-        fatal("daemonize() failed: %.200s", strerror(errno));
-    start_device_log();
+        fatal("daemonize() failed: (errno:%d)", errno);
 #endif
+
+    start_device_log();
+    D("Handling main()\n");
+
+    //sdbd will never die on emulator!
+    signal(SIGTERM, handle_sig_term); /* tizen specific */
     return sdb_main(0, DEFAULT_SDB_PORT);
 #endif
 }

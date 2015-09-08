@@ -1,14 +1,14 @@
 /*
- * Copyright (C) 2006 The Android Open Source Project
+ * Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the License);
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
+ * distributed under the License is distributed on an AS IS BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -38,7 +38,7 @@ int socket_local_client(const char *name, int namespaceId, int type)
 #include <sys/types.h>
 
 #include "socket_local.h"
-
+#include "strutils.h"
 #define LISTEN_BACKLOG 4
 
 /* Documented in header file. */
@@ -75,8 +75,8 @@ int socket_make_sockaddr_un(const char *name, int namespaceId,
                 goto error;
             }
 
-            strcpy(p_addr->sun_path, FILESYSTEM_SOCKET_PREFIX);
-            strcat(p_addr->sun_path, name);
+            s_strncpy(p_addr->sun_path, FILESYSTEM_SOCKET_PREFIX, strlen(FILESYSTEM_SOCKET_PREFIX));
+            strncat(p_addr->sun_path, name, strlen(name));
 #endif /*HAVE_LINUX_LOCAL_SOCKET_NAMESPACE*/
         break;
 
@@ -88,8 +88,8 @@ int socket_make_sockaddr_un(const char *name, int namespaceId,
                 goto error;
             }
 
-            strcpy(p_addr->sun_path, ANDROID_RESERVED_SOCKET_PREFIX);
-            strcat(p_addr->sun_path, name);
+            s_strncpy(p_addr->sun_path, ANDROID_RESERVED_SOCKET_PREFIX, strlen(ANDROID_RESERVED_SOCKET_PREFIX));
+            strncat(p_addr->sun_path, name, strlen(name));
         break;
 
         case ANDROID_SOCKET_NAMESPACE_FILESYSTEM:
@@ -100,7 +100,7 @@ int socket_make_sockaddr_un(const char *name, int namespaceId,
                 goto error;
             }
 
-            strcpy(p_addr->sun_path, name);
+            s_strncpy(p_addr->sun_path, name, strlen(name));
         break;
         default:
             // invalid namespace id

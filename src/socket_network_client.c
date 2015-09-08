@@ -1,22 +1,22 @@
-/* libs/cutils/socket_network_client.c
-**
-** Copyright 2006, The Android Open Source Project
-**
-** Licensed under the Apache License, Version 2.0 (the "License"); 
-** you may not use this file except in compliance with the License. 
-** You may obtain a copy of the License at 
-**
-**     http://www.apache.org/licenses/LICENSE-2.0 
-**
-** Unless required by applicable law or agreed to in writing, software 
-** distributed under the License is distributed on an "AS IS" BASIS, 
-** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-** See the License for the specific language governing permissions and 
-** limitations under the License.
-*/
+/*
+ * Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved
+ *
+ * Licensed under the Apache License, Version 2.0 (the License);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an AS IS BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// libs/cutils/socket_network_client.c
 
 #include "sockets.h"
-
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -38,27 +38,58 @@
  */
 int socket_network_client(const char *host, int port, int type)
 {
-    struct hostent *hp;
+    struct hostent hostbuf, *hp;
     struct sockaddr_in addr;
     int s;
+    size_t hstbuflen = 1024;
+    int res, herr;
+    char *tmphstbuf;
 
-    hp = gethostbyname(host);
-    if(hp == 0) return -1;
-    
+    tmphstbuf = malloc(hstbuflen);
+    if (tmphstbuf == NULL) {
+        fprintf(stderr, "out of memory\n");
+        exit(-1);
+    }
+
+    while ((res = gethostbyname_r(host, &hostbuf, tmphstbuf, hstbuflen, &hp, &herr)) == ERANGE) {
+        // enlarge the buffer
+        hstbuflen *= 2;
+        tmphstbuf = realloc(tmphstbuf, hstbuflen);
+        if (tmphstbuf == NULL) {
+            fprintf(stderr, "out of memory\n");
+            exit(-1);
+        }
+    }
+    if (res || hp == NULL) {
+        if (tmphstbuf != NULL) {
+            free(tmphstbuf);
+        }
+        return -1;
+    }
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = hp->h_addrtype;
     addr.sin_port = htons(port);
     memcpy(&addr.sin_addr, hp->h_addr, hp->h_length);
 
     s = socket(hp->h_addrtype, type, 0);
-    if(s < 0) return -1;
-
-    if(connect(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        close(s);
+    if(s < 0) {
+        if (tmphstbuf != NULL) {
+            free(tmphstbuf);
+        }
         return -1;
     }
 
+    if(connect(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        close(s);
+
+        if (tmphstbuf != NULL) {
+            free(tmphstbuf);
+        }
+        return -1;
+    }
+    if (tmphstbuf != NULL) {
+        free(tmphstbuf);
+    }
     return s;
 
 }
-

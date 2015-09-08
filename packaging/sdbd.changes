@@ -1,0 +1,15 @@
+* Thu Nov 27 2014 Sanghoon Hong <sanghoon.hong@samsung.com>
+ - added a notify thread for emulator detection
+ - fixed a broken connection issue while 'pull'ing files
+* Wed Nov 27 2013 Yoonki Park <yoonki.park@samsung.com>
+ - changed port redirection to usb0 instead of loopback
+* Wed Apr 04 2013 Ho Namkoong <ho.namkoong@samsung.com>
+ - supports platform gdbserver
+* Mon Dec 02 2012 Yoonki Park <yoonki.park@samsung.com>
+ - supports cs report service using inotify
+* Mon Dec 02 2012 Yoonki Park <yoonki.park@samsung.com>
+ - sdb code dropped from adb (Ice Cream Samdwich 4.1.1)
+* Wed Apr 18 2012 Yoonki Park <yoonki.park@samsung.com>
+ - set dir permission to 777
+* Sat Mar 31 2012 Yoonki Park <yoonki.park@samsung.com>
+ - let sshd be daemon and create sshd.pid file

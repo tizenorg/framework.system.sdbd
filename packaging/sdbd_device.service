@@ -1,0 +1,9 @@
+[Unit]
+Description=sdbd
+
+[Service]
+Type=forking
+Environment=DISPLAY=:0
+PIDFile=/tmp/.sdbd.pid
+RemainAfterExit=yes
+ExecStart=/usr/sbin/sdbd
