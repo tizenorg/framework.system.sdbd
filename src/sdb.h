@@ -18,8 +18,11 @@
 #define __SDB_H
 
 #include <limits.h>
+#include <stddef.h>
 
 #include "transport.h"  /* readx(), writex() */
+#include "fdevent.h"
+#include "sdbd_plugin.h"
 
 #define MAX_PAYLOAD 4096
 
@@ -34,7 +37,8 @@
 #define A_VERSION 0x02000000        // SDB protocol version
 
 #define SDB_VERSION_MAJOR 2         // Used for help/version information
-#define SDB_VERSION_MINOR 1         // Used for help/version information
+#define SDB_VERSION_MINOR 2         // Used for help/version information
+#define SDB_VERSION_PATCH 31        // Used for help/version information
 
 #define SDB_SERVER_VERSION 0        // Increment this when we want to force users to start a new sdb server
 
@@ -86,11 +90,6 @@ struct asocket {
         ** but packets are still queued for delivery
         */
     int    closing;
-
-        /* flag: quit adbd when both ends close the
-        ** local service socket
-        */
-    int    exit_on_close;
 
         /* the asocket we are connected to
         */
@@ -223,6 +222,53 @@ struct alistener
     adisconnect  disconnect;
 };
 
+#define UNKNOWN "unknown"
+#define INFOBUF_MAXLEN 64
+#define INFO_VERSION "2.2.0"
+typedef struct platform_info {
+    char platform_info_version[INFOBUF_MAXLEN];
+    char model_name[INFOBUF_MAXLEN]; // Emulator
+    char platform_name[INFOBUF_MAXLEN]; // Tizen
+    char platform_version[INFOBUF_MAXLEN]; // 2.2.1
+    char profile_name[INFOBUF_MAXLEN]; // 2.2.1
+} pinfo;
+
+#define ENABLED "enabled"
+#define DISABLED "disabled"
+#define CPUARCH_ARMV6 "armv6"
+#define CPUARCH_ARMV7 "armv7"
+#define CPUARCH_X86 "x86"
+#define CAPBUF_SIZE 4096
+#define CAPBUF_ITEMSIZE 32
+typedef struct platform_capabilities
+{
+    char secure_protocol[CAPBUF_ITEMSIZE];      // enabled or disabled
+    char intershell_support[CAPBUF_ITEMSIZE];   // enabled or disabled
+    char filesync_support[CAPBUF_ITEMSIZE];     // push or pull or pushpull or disabled
+    char rootonoff_support[CAPBUF_ITEMSIZE];    // enabled or disabled
+    char zone_support[CAPBUF_ITEMSIZE];         // enabled or disabled
+    char multiuser_support[CAPBUF_ITEMSIZE];    // enabled or disabled
+    char syncwinsz_support[CAPBUF_ITEMSIZE];    // enabled or disabled
+    char usbproto_support[CAPBUF_ITEMSIZE];     // enabled or disabled
+    char sockproto_support[CAPBUF_ITEMSIZE];    // enabled or disabled
+
+    char cpu_arch[CAPBUF_ITEMSIZE];             // cpu architecture (ex. x86)
+    char profile_name[CAPBUF_ITEMSIZE];         // profile name (ex. mobile)
+    char vendor_name[CAPBUF_ITEMSIZE];          // vendor name (ex. Tizen)
+
+    char platform_version[CAPBUF_ITEMSIZE];     // platform version (ex. 2.3.0)
+    char product_version[CAPBUF_ITEMSIZE];      // product version (ex. 1.0)
+    char sdbd_version[CAPBUF_ITEMSIZE];         // sdbd version
+    char sdbd_plugin_version[CAPBUF_ITEMSIZE];  // sdbd plugin version
+} pcap;
+pcap g_capabilities;
+
+#define SDBD_PLUGIN_PATH    "/usr/lib/libsdbd_plugin.so"
+#define SDBD_PLUGIN_INTF    "sdbd_plugin_cmd_proc"
+typedef int (*SDBD_PLUGIN_CMD_PROC_PTR)(const char*, const char*, sdbd_plugin_param);
+extern SDBD_PLUGIN_CMD_PROC_PTR sdbd_plugin_cmd_proc;
+int request_plugin_cmd(const char* cmd, const char* in_buf, char *out_buf, unsigned int out_len);
+int request_plugin_verification(const char* cmd, const char* in_buf);
 
 void print_packet(const char *label, apacket *p);
 
@@ -322,14 +368,14 @@ void log_service(int fd, void *cookie);
 void remount_service(int fd, void *cookie);
 char * get_log_file_path(const char * log_name);
 
-int rootshell_mode;// 0: developer, 1: root
-int usb_mode; // 2:mtp 6:rndis
+int rootshell_mode; // 0: developer, 1: root
+int hostshell_mode; // 0: foreground zone, 1: host  2: denied
+int booting_done; // 0: platform booting is in progess 1: platform booting is done
 
 // This is the users and groups config for the platform
 
 #define SID_ROOT        0    /* traditional unix root user */
 #define SID_TTY         5    /* group for /dev/ptmx */
-#define SID_APP         5000 /* application */
 #define SID_DEVELOPER   5100 /* developer with SDK */
 #define SID_APP_LOGGING 6509
 #define SID_SYS_LOGGING 6527
@@ -345,6 +391,9 @@ void set_root_privileges();
 int get_emulator_forward_port(void);
 int get_emulator_name(char str[], int str_size);
 int get_device_name(char str[], int str_size);
+int get_emulator_hostip(char str[], int str_size);
+int get_emulator_guestip(char str[], int str_size);
+
 /* packet allocator */
 apacket *get_apacket(void);
 void put_apacket(apacket *p);
@@ -462,7 +511,7 @@ int  local_connect_arbitrary_ports(int console_port, int sdb_port, const char *d
 void usb_init();
 void usb_cleanup();
 int usb_write(usb_handle *h, const void *data, int len);
-int usb_read(usb_handle *h, void *data, int len);
+int usb_read(usb_handle *h, void *data, unsigned len);
 int usb_close(usb_handle *h);
 void usb_kick(usb_handle *h);
 
@@ -496,6 +545,8 @@ int handle_host_request(char *service, transport_type ttype, char* serial, int r
 int copy_packet(apacket* dest, apacket* src);
 
 int is_emulator(void);
+int is_container_enabled(void);
+int has_container(void);
 #define DEFAULT_DEVICENAME "unknown"
 
 #if SDB_HOST /* tizen-specific */
@@ -510,4 +561,6 @@ int read_line(const int fd, char* ptr, const size_t maxlen);
 #endif
 
 #define USB_NODE_FILE "/dev/samsung_sdb"
-#define DEBUG_MODE_KEY "db/usb/sel_mode"
+#define CMD_ATTACH  "/usr/bin/vsm-attach"
+#define CMD_FOREGROUND "/usr/bin/vsm-foreground"
+#define CMD_LIST "/usr/bin/vsm-list"

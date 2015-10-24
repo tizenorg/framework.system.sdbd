@@ -124,8 +124,7 @@ char *str_trim(const char* string)
         e--;
 
     ret = strdup(s);
-    if (ret == NULL) {
-        fprintf(stderr, "failed to strdup");
+    if(ret == NULL) {
         return NULL;
     }
     ret[e - s + 1] = 0;
@@ -158,5 +157,49 @@ int spawn(char* program, char** arg_list)
     }
 
     return pid;
+}
+
+char** str_split(char* a_str, const char a_delim) {
+	char** result = 0;
+	size_t count = 0;
+	char* tmp = a_str;
+	char* last_comma = 0;
+	char delim[2];
+	delim[0] = a_delim;
+	delim[1] = 0;
+	char *ptr;
+
+	/* Count how many elements will be extracted. */
+	while (*tmp) {
+		if (a_delim == *tmp) {
+			count++;
+			last_comma = tmp;
+		}
+		tmp++;
+	}
+
+	/* Add space for trailing token. */
+	count += last_comma < (a_str + strlen(a_str) - 1);
+
+	/* Add space for terminating null string so caller
+	 knows where the list of returned strings ends. */
+	count++;
+
+	result = malloc(sizeof(char*) * count);
+
+	if (result) {
+		size_t idx = 0;
+		char* token = strtok_r(a_str, delim, &ptr);
+
+		while (token) {
+			//assert(idx < count);
+			*(result + idx++) = strdup(token);
+			token = strtok_r(0, delim, &ptr);
+		}
+		//assert(idx == count - 1);
+		*(result + idx) = 0;
+	}
+
+	return result;
 }
 

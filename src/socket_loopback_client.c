@@ -34,19 +34,50 @@
 #endif
 
 #include "strutils.h"
+extern int hostshell_mode;
 /* Connect to port on the loopback IP interface. type is
  * SOCK_STREAM or SOCK_DGRAM. 
  * return is a file descriptor or -1 on error
  */
 int socket_loopback_client(int port, int type)
 {
+    char zone_ipaddr[1025] = {0, };
+    char name_vsm[1025] = {0, };
+    int namelen;
     struct sockaddr_in addr;
     int s;
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (hostshell_mode == 0) {
+        FILE *fp;
+        fp = popen("/usr/bin/vsm-foreground", "r");
+        if (fp == NULL) {
+            return 0;
+        }
+        fgets(name_vsm, 1025, fp);
+        pclose(fp);
+
+        snprintf(zone_ipaddr, 1025, "/usr/bin/vsm-info -i -n %s", name_vsm);
+        fp = popen(zone_ipaddr, "r");
+        if (fp == NULL) {
+            return 0;
+        }
+        fgets(zone_ipaddr, 1025, fp);
+        pclose(fp);
+
+        //trim zone ipaddr
+        namelen = strlen(zone_ipaddr);
+        while (zone_ipaddr[--namelen] == '\n')
+            ;
+        zone_ipaddr[namelen + 1] = '\0';
+
+        addr.sin_addr.s_addr = inet_addr(zone_ipaddr);
+    } else {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
 
     s = socket(AF_INET, type, 0);
     if(s < 0) return -1;
@@ -81,7 +112,9 @@ int socket_ifr_client(int port, int type, char *ifr_dev)
         return -1;
     }
 
-    addr.sin_addr.s_addr = inet_addr(inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+    char buf[1025] = {0, };
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr, buf, sizeof(buf));
+    addr.sin_addr.s_addr = inet_addr(buf);
 
     close(s);
 
@@ -138,7 +171,7 @@ int ifconfig(char *ifname, char *address, char *netmask, int activated) {
         ifr.ifr_flags |= ~IFF_UP;
     }
     if (ioctl(sockfd, SIOCGIFFLAGS, &ifr) < 0) {
-        fprintf(stderr,"cannot set SIOCGIFFLAGS flags: (errno:%d)\n", errno);
+        fprintf(stderr,"cannot set SIOCGIFFLAGS flags: errno:%d\n", errno);
         close(sockfd);
         return -1;
     }

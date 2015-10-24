@@ -889,7 +889,7 @@ void register_socket_transport(int s, const char *serial, int port, int local, c
 {
     atransport *t = calloc(1, sizeof(atransport));
     if (t == NULL) {
-        D("could not allocate atransport'\n");
+        D("failed to allocate memory of transport struct\n");
         return;
     }
     char buff[32];
@@ -1020,12 +1020,12 @@ void broadcast_transport(apacket *p)
 
 void register_usb_transport(usb_handle *usb, const char *serial, unsigned writeable)
 {
+    char device_name[256];
     atransport *t = calloc(1, sizeof(atransport));
     if (t == NULL) {
-        D("cannot allocate atransport");
+        D("failed to allocate memory of transport struct\n");
         return;
     }
-    char device_name[256];
 
     D("transport: %p init'ing for usb_handle %p (sn='%s')\n", t, usb,
       serial ? serial : "");
@@ -1073,7 +1073,7 @@ int readx(int fd, void *ptr, size_t len)
             p += r;
         } else {
             if (r < 0) {
-                D("readx: fd=%d (errno:%d)\n", fd, errno);
+                D("readx: fd=%d error %d\n", fd, errno);
                 if (errno == EINTR)
                     continue;
             } else {

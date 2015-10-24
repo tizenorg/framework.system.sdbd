@@ -16,7 +16,7 @@
 // libs/cutils/socket_network_client.c
 
 #include "sockets.h"
-#include <stdio.h>
+
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -47,8 +47,7 @@ int socket_network_client(const char *host, int port, int type)
 
     tmphstbuf = malloc(hstbuflen);
     if (tmphstbuf == NULL) {
-        fprintf(stderr, "out of memory\n");
-        exit(-1);
+        return -1;
     }
 
     while ((res = gethostbyname_r(host, &hostbuf, tmphstbuf, hstbuflen, &hp, &herr)) == ERANGE) {
@@ -56,8 +55,7 @@ int socket_network_client(const char *host, int port, int type)
         hstbuflen *= 2;
         tmphstbuf = realloc(tmphstbuf, hstbuflen);
         if (tmphstbuf == NULL) {
-            fprintf(stderr, "out of memory\n");
-            exit(-1);
+            return -1;
         }
     }
     if (res || hp == NULL) {
@@ -93,3 +91,4 @@ int socket_network_client(const char *host, int port, int type)
     return s;
 
 }
+

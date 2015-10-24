@@ -97,7 +97,7 @@ int usb_write(usb_handle *h, const void *data, int len)
     return 0;
 }
 
-int usb_read(usb_handle *h, void *data, int len)
+int usb_read(usb_handle *h, void *data, unsigned len)
 {
     int n;
 
@@ -120,9 +120,10 @@ void usb_init()
 
     h = calloc(1, sizeof(usb_handle));
     if (h == NULL) {
-        D("cannot allocate usb handle");
+        D("failed to allocate memory of usb_handle\n");
         return;
     }
+
     h->fd = -1;
     sdb_cond_init(&h->notify, 0);
     sdb_mutex_init(&h->lock, 0);

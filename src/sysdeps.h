@@ -292,6 +292,7 @@ static __inline__  int  sdb_is_absolute_host_path( const char*  path )
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string.h>
+#include <time.h>
 
 #define OS_PATH_SEPARATOR '/'
 #define OS_PATH_SEPARATOR_STR "/"
@@ -462,13 +463,10 @@ static __inline__  int  sdb_socket_setbufsize( int   fd, int  bufsize )
     return setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt));
 }
 
-static __inline__ int  disable_tcp_nagle(int fd)
+static __inline__ void  disable_tcp_nagle(int fd)
 {
-    int on = 1;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (void*) &on, sizeof(on)) < 0) {
-        return -1;
-    }
-    return 0;
+    int  on = 1;
+    setsockopt( fd, IPPROTO_TCP, TCP_NODELAY, (void*)&on, sizeof(on) );
 }
 
 
@@ -500,7 +498,10 @@ static __inline__ int  sdb_socketpair( int  sv[2] )
 
 static __inline__ void  sdb_sleep_ms( int  mseconds )
 {
-    usleep( mseconds*1000 );
+    struct timespec ts;
+    ts.tv_sec = mseconds / 1000;
+    ts.tv_nsec = (mseconds % 1000) * 1000000;
+    nanosleep(&ts, NULL);
 }
 
 static __inline__ int  sdb_mkdir(const char*  path, int mode)

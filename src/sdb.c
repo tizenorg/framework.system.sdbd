@@ -27,11 +27,13 @@
 #include <signal.h>
 #include <grp.h>
 #include <pthread.h>
+#include <dlfcn.h>
 
 #include "sysdeps.h"
 #include "sdb.h"
 #include "strutils.h"
 #include "utils.h"
+#include "sdktools.h"
 
 #if !SDB_HOST
 #include <linux/prctl.h>
@@ -39,24 +41,94 @@
 #else
 #include "usb_vendors.h"
 #endif
-#include <system_info_internal.h>
+#include <system_info.h>
 #include <vconf.h>
 #include "utils.h"
-
 #define PROC_CMDLINE_PATH "/proc/cmdline"
 #define USB_SERIAL_PATH "/sys/class/usb_mode/usb0/iSerial"
 
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#define GUEST_IP_INTERFACE "eth0"
+
+SDB_MUTEX_DEFINE(zone_check_lock);
 #if SDB_TRACE
 SDB_MUTEX_DEFINE( D_lock );
 #endif
 
 int HOST = 0;
+int initial_zone_mode_check = 0;
+
+void* g_sdbd_plugin_handle = NULL;
+SDBD_PLUGIN_CMD_PROC_PTR sdbd_plugin_cmd_proc = NULL;
 
 int is_emulator(void) {
-    if (access(USB_NODE_FILE, F_OK) == 0) {
+/* XXX: If the target device supports x86 architecture,
+ *      this routine is INVALID. */
+#ifdef TARGET_ARCH_X86
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int is_container_enabled(void) {
+	bool value;
+	int ret;
+	ret = system_info_get_platform_bool("tizen.org/feature/container", &value);
+	if (ret != SYSTEM_INFO_ERROR_NONE) {
+		D("failed to get container information: %d\n", errno);
+		return 0;
+	} else {
+		D("tizen container: %d\n", value);
+		if (value == true)
+			return 1;
+		else
+			return 0;
+	}
+}
+
+int has_container(void) {
+    FILE *fp;
+    char name_vsm[1025] = {0, };
+    char empty_vsm[1025] = {0, };
+    fp = popen(CMD_LIST, "r");
+    if(fp == NULL) {
+        D("Failed to create pipe of %s \n", CMD_LIST);
         return 0;
-    } else {
+    }
+    fgets(name_vsm, 1025, fp);
+    pclose(fp);
+
+    D("zone list :%s\n", name_vsm);
+    // check zone list
+    if((name_vsm[0] == '\n')  || !strncmp(name_vsm, empty_vsm, 1025))
+        return 0;
+    else
         return 1;
+}
+
+char** get_zone_list() {
+    FILE *fp;
+    char name_vsm[1025] = {0, };
+    char empty_vsm[1025] = {0, };
+    fp = popen(CMD_LIST, "r");
+    if(fp == NULL) {
+        D("Failed to create pipe of %s \n", CMD_LIST);
+        return 0;
+    }
+    fgets(name_vsm, 1025, fp);
+    pclose(fp);
+
+    D("zone list :%s\n", name_vsm);
+
+    if((name_vsm[0] == '\n')  || !strncmp(name_vsm, empty_vsm, 1025))
+        return NULL;
+    else {
+        char** tokens = str_split(name_vsm, '\n');
+        return tokens;
     }
 }
 
@@ -66,19 +138,6 @@ void handle_sig_term(int sig) {
         sdb_unlink(SDB_PIDPATH);
 #endif
     char *cmd1_args[] = {"/usr/bin/killall", "/usr/bin/debug_launchpad_preloading_preinitializing_daemon", NULL};
-
-    if (!is_emulator()) {
-        int val = 0;
-        if (vconf_get_int(DEBUG_MODE_KEY, &val)) {
-            D("Failed to get debug mode\n");
-        } else {
-            if (usb_mode != 6 && val == 6) { // set mtp mode by default!.
-                vconf_set_int(DEBUG_MODE_KEY, 2);
-            }
-        }
-    } else {
-        // do nothing on a emulator
-    }
     spawn("/usr/bin/killall", cmd1_args);
     sdb_sleep_ms(1000);
 }
@@ -100,7 +159,7 @@ void fatal_errno(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "error: (errno:%d): ", errno);
+    fprintf(stderr, "errno: %d: ", errno);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
@@ -435,10 +494,9 @@ int get_emulator_forward_port() {
     return port;
 }
 
-int get_emulator_name(char str[], int str_size) {
+static int get_cmdline_value(char *split, char str[], int str_size) {
     char cmdline[512];
     int fd = unix_open(PROC_CMDLINE_PATH, O_RDONLY);
-    char *name_str = "vm_name=";
 
     if (fd < 0) {
         D("fail to read /proc/cmdline\n");
@@ -446,8 +504,8 @@ int get_emulator_name(char str[], int str_size) {
     }
     if(read_line(fd, cmdline, sizeof(cmdline))) {
         D("qemu cmd: %s\n", cmdline);
-        if (get_str_cmdline(cmdline, name_str, str, str_size) < 1) {
-            D("could not get emulator name from cmdline\n");
+        if (get_str_cmdline(cmdline, split, str, str_size) < 1) {
+            D("could not get the (%s) value from cmdline\n", split);
             sdb_close(fd);
             return -1;
         }
@@ -456,9 +514,13 @@ int get_emulator_name(char str[], int str_size) {
     return 0;
 }
 
+int get_emulator_name(char str[], int str_size) {
+    return get_cmdline_value("vm_name=", str, str_size);
+}
+
 int get_device_name(char str[], int str_size) {
     char *value = NULL;
-    int r = system_info_get_value_string(SYSTEM_INFO_KEY_MODEL, &value);
+    int r = system_info_get_platform_string("http://tizen.org/system/model_name", &value);
     if (r != SYSTEM_INFO_ERROR_NONE) {
         D("fail to get system model:%d\n", errno);
         return -1;
@@ -485,6 +547,40 @@ int get_device_name(char str[], int str_size) {
     sdb_close(fd);
     */
     return -1;
+}
+
+int get_emulator_hostip(char str[], int str_size) {
+    return get_cmdline_value("host_ip=", str, str_size);
+}
+
+int get_emulator_guestip(char str[], int str_size) {
+    int           s;
+    struct ifreq ifr;
+    struct sockaddr_in *sin;
+
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    if(s < 0) {
+        D("socket error\n");
+        return -1;
+    }
+
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", GUEST_IP_INTERFACE);
+    if(ioctl(s, SIOCGIFHWADDR, &ifr) < 0) {
+        D("ioctl hwaddr error\n");
+        sdb_close(s);
+        return -1;
+    }
+
+    if(ioctl(s, SIOCGIFADDR, &ifr) < 0) {
+        D("ioctl addr error\n");
+        sdb_close(s);
+        return -1;
+    }
+    sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    snprintf(str, str_size, "%s", inet_ntoa(sin->sin_addr));
+    sdb_close(s);
+
+    return 0;
 }
 
 void parse_banner(char *banner, atransport *t)
@@ -581,6 +677,9 @@ void handle_packet(apacket *p, atransport *t)
         if (is_pwlocked() && t->connection_state == CS_PWLOCK) { // in case of already locked before get A_CNXN
             D("open failed due to password locked before get A_CNXN:%d\n", t->connection_state);
             send_close(0, p->msg.arg0, t);
+        } else if (hostshell_mode == 2){
+            D("open failed due to denied mode\n");
+            send_close(0, p->msg.arg0, t);
         } else {
             if(t->connection_state != CS_OFFLINE) {
                 char *name = (char*) p->data;
@@ -658,9 +757,7 @@ static void ss_listener_event_func(int _fd, unsigned ev, void *_l)
         fd = sdb_socket_accept(_fd, &addr, &alen);
         if(fd < 0) return;
 
-        if (sdb_socket_setbufsize(fd, CHUNK_SIZE) == -1) {
-            D("failed to set buffer size of sdb socket: (errno:%d)\n", errno);
-        }
+        sdb_socket_setbufsize(fd, CHUNK_SIZE);
 
         s = create_local_socket(fd);
         if(s) {
@@ -856,6 +953,10 @@ static BOOL WINAPI ctrlc_handler(DWORD type)
 
 static void sdb_cleanup(void)
 {
+    if (g_sdbd_plugin_handle) {
+        dlclose(g_sdbd_plugin_handle);
+        g_sdbd_plugin_handle = NULL;
+    }
     usb_cleanup();
 }
 
@@ -1150,15 +1251,29 @@ int is_pwlocked(void) {
         pwlock_status = 0;
         D("failed to get pw lock status\n");
     }
+#ifdef _WEARABLE
+    D("wearable lock applied\n");
+    // for wearable which uses different VCONF key (lock type)
+	if (vconf_get_int(VCONFKEY_SETAPPL_PRIVACY_LOCK_TYPE_INT, &pwlock_type)) {
+		pwlock_type = 0;
+		D("failed to get pw lock type\n");
+	}
+	  if ((pwlock_status == VCONFKEY_IDLE_LOCK) && (pwlock_type != SETTING_PRIVACY_LOCK_TYPE_NONE)) {
+		   D("device has been locked\n");
+		   return 1; // locked!
+	  }
+#else
+	D("mobile lock applied\n");
+    // for mobile
     if (vconf_get_int(VCONFKEY_SETAPPL_SCREEN_LOCK_TYPE_INT, &pwlock_type)) {
         pwlock_type = 0;
         D("failed to get pw lock type\n");
     }
-    if (pwlock_status == VCONFKEY_IDLE_LOCK && (pwlock_type == SETTING_SCREEN_LOCK_TYPE_SIMPLE_PASSWORD || pwlock_type == SETTING_SCREEN_LOCK_TYPE_PASSWORD)) {
+    if (pwlock_status == VCONFKEY_IDLE_LOCK && ((pwlock_type != SETTING_SCREEN_LOCK_TYPE_NONE) && (pwlock_type != SETTING_SCREEN_LOCK_TYPE_SWIPE))) {
         D("device has been locked\n");
         return 1; // locked!
     }
-
+#endif
     return 0; // unlocked!
 }
 
@@ -1196,15 +1311,107 @@ void register_pwlock_cb() {
     }
 }
 
+#include <dbus/dbus.h>
+#include <dbus/dbus-glib.h>
+#include <dbus/dbus-glib-lowlevel.h>
+
+#define BOOTING_DONE_SIGNAL    "BootingDone"
+#define DEVICED_CORE_INTERFACE "org.tizen.system.deviced.core"
+#define SDBD_BOOT_INFO_FILE "/tmp/sdbd_boot_info"
+
+static DBusHandlerResult __sdbd_dbus_signal_filter(DBusConnection *conn,
+		DBusMessage *message, void *user_data) {
+	D("got dbus message\n");
+	const char *interface;
+
+	DBusError error;
+	dbus_error_init(&error);
+
+	interface = dbus_message_get_interface(message);
+	if (interface == NULL) {
+		D("reject by security issue - no interface\n");
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+	}
+
+	if (dbus_message_is_signal(message, DEVICED_CORE_INTERFACE,
+			BOOTING_DONE_SIGNAL)) {
+		booting_done = 1;
+		if (access(SDBD_BOOT_INFO_FILE, F_OK) == 0) {
+			D("booting is done before\n");
+		} else {
+			FILE *f = fopen(SDBD_BOOT_INFO_FILE, "w");
+			if (f != NULL) {
+				fprintf(f, "%d", 1);
+				fclose(f);
+			}
+		}
+		D("booting is done\n");
+	}
+
+	D("handled dbus message\n");
+	return DBUS_HANDLER_RESULT_HANDLED;
+}
+
+static void *bootdone_cb(void *x) {
+	int MAX_LOCAL_BUFSZ = 128;
+	DBusError error;
+	DBusConnection *bus;
+	char rule[MAX_LOCAL_BUFSZ];
+	GMainLoop *mainloop;
+
+	g_type_init();
+
+	dbus_error_init(&error);
+	bus = dbus_bus_get(DBUS_BUS_SYSTEM, &error);
+	if (!bus) {
+		D("Failed to connect to the D-BUS daemon: %s", error.message);
+		dbus_error_free(&error);
+		return -1;
+	}
+	dbus_connection_setup_with_g_main(bus, NULL);
+
+	snprintf(rule, MAX_LOCAL_BUFSZ, "type='signal',interface='%s'",
+			DEVICED_CORE_INTERFACE);
+	/* listening to messages */
+	dbus_bus_add_match(bus, rule, &error);
+	if (dbus_error_is_set(&error)) {
+		D("Fail to rule set: %s", error.message);
+		dbus_error_free(&error);
+		return -1;
+	}
+
+	if (dbus_connection_add_filter(bus, __sdbd_dbus_signal_filter, NULL, NULL)
+			== FALSE)
+		return -1;
+
+	D("booting signal initialized\n");
+	mainloop = g_main_loop_new(NULL, FALSE);
+	g_main_loop_run(mainloop);
+
+	D("dbus loop exited");
+
+	return 0;
+}
+
+void register_bootdone_cb() {
+	D("registerd bootdone callback\n");
+
+	sdb_thread_t t;
+	if (sdb_thread_create(&t, bootdone_cb, NULL)) {
+		D("cannot create service thread\n");
+		return;
+	}
+}
+
 int set_developer_privileges() {
     gid_t groups[] = { SID_DEVELOPER, SID_APP_LOGGING, SID_SYS_LOGGING, SID_INPUT };
     if (setgroups(sizeof(groups) / sizeof(groups[0]), groups) != 0) {
-        D("set groups failed (errno: %d, %s)\n", errno, strerror(errno));
+        D("set groups failed (errno: %d)\n", errno);
     }
 
     // then switch user and group to developer
     if (setgid(SID_DEVELOPER) != 0) {
-        D("set group id failed (errno: %d, %s)\n", errno, strerror(errno));
+        D("set group id failed (errno: %d)\n", errno);
         return -1;
     }
 
@@ -1221,7 +1428,7 @@ int set_developer_privileges() {
         }
     }
     // TODO: use pam later
-    putenv("HOME=/home/developer");
+    setenv("HOME", "/home/developer", 1);
 
     return 1;
 }
@@ -1233,32 +1440,620 @@ static void execute_required_process() {
     spawn("/usr/bin/debug_launchpad_preloading_preinitializing_daemon", cmd_args);
 }
 
-static void init_sdk_requirements() {
-    struct stat st;
+#include <stdio.h>
+#include <glib.h>
+#include <vasum.h>
 
-    // initialize usb mode
-    usb_mode = 0;
+static const char *const state_string[] = {
+	"STOPPED",
+	"STARTING",
+	"RUNNING",
+	"STOPPING",
+	"ABORTING",
+	"FREEZING",
+	"THAWED",
+};
 
-    if (stat(ONDEMAND_ROOT_PATH, &st) == -1) {
+static const char *const event_string[] = {
+	"NONE",
+	"CREATED",
+	"DESTROYED",
+	"SWITCHED",
+};
+
+static void execute_required_process_in_each_zone(char* zone_name) {
+	D("Name of zone which executes required processes : %s \n", zone_name);
+
+	// debug-launchpad need to be executed in each zone
+	char zone_name_with_option[100] = {0,};
+	snprintf(zone_name_with_option, sizeof(zone_name_with_option), "--name=%s", zone_name);
+	char *arg_list[] = {CMD_ATTACH, zone_name_with_option, "--", "/usr/bin/debug_launchpad_preloading_preinitializing_daemon", NULL};
+	spawn(CMD_ATTACH, arg_list);
+}
+
+static int vasum_zone_state_cb( vsm_zone_h zone, vsm_zone_state_t state, void * userdata)
+{
+	char * zone_name;
+	vsm_zone_state_t before_state, new_state;
+
+	zone_name = vsm_get_zone_name(zone);
+	before_state = vsm_get_zone_state(zone);
+	new_state = state;
+
+	D("Zone state is changed : Name[%s] , Before State[%s], Changed State[%s]\n",
+			zone_name , state_string[state], state_string[state]);
+
+
+	if(state == 2) {
+		sdb_mutex_lock(&zone_check_lock);
+		// if state of zone is "RUNNING", execute required process in zone.
+		execute_required_process_in_each_zone(zone_name);
+
+		// in the case sdbd is started up before zone, check zone/host mode
+		if(!initial_zone_mode_check) {
+			D("set zone mode on when zone is started up\n");
+			initial_zone_mode_check = 1;
+			hostshell_mode = 0;
+		}
+		sdb_mutex_unlock(&zone_check_lock);
+	}
+
+
+	return 0;
+}
+
+static int vasum_event_cb( vsm_zone_h zone, vsm_zone_event_t event, void * userdata)
+{
+	char * zone_name;
+
+	zone_name = vsm_get_zone_name(zone);
+
+	D("Zone got event : Name[%s], Event[%s]\n", zone_name, event_string[event]);
+
+	return 0;
+}
+
+static gboolean vasum_context_callback(GIOChannel * channel, GIOCondition condition,
+		void *data)
+{
+	vsm_context_h ctx = (vsm_context_h)data;
+	/* Call handler function for update vsm_context */
+	vsm_enter_eventloop(ctx, 0, 0);
+	return TRUE;
+}
+
+
+static void *zone_check_thread(void *x) {
+	GMainLoop *mainloop;
+	vsm_context_h ctx;
+	int fd, ret;
+	int state_hndl = 0;
+	int event_hndl = 0;
+
+	mainloop = g_main_loop_new(NULL, FALSE);
+
+	int i;
+	for(i = 0; i < 10; i++) {
+		D("Try to get vasum context : try %d\n", i);
+		ctx = vsm_create_context();
+		if (ctx != NULL) {
+			D("Got vasum context\n");
+			break;
+		}
+		if(i == 9) {
+			D("Failed to get vasum context, exit vasum zone check thread\n");
+			return;
+		}
+		D("Failed get vasum context\n");
+		sdb_sleep_ms(100);
+	}
+
+	/* Get vasum event file descriptor from vsm context */
+	fd = vsm_get_poll_fd(ctx);
+	if (fd < 0) {
+		D("Failed to get poll fd\n");
+	}
+
+	GIOChannel *channel = g_io_channel_unix_new(fd);
+	if (channel == NULL) {
+		D("Failed to allocate channel allocation\n");
+		return;
+	}
+
+	/* Bind vasum context to g_main_loop watch handler */
+	g_io_add_watch(channel, G_IO_IN, vasum_context_callback, ctx);
+
+	state_hndl = vsm_add_state_changed_callback(ctx, vasum_zone_state_cb, (void *) ctx);
+	if (state_hndl < 0) {
+		D("Failed to register state changed cb\n");
+		return -1;
+	}
+
+	event_hndl = vsm_add_event_callback(ctx, vasum_event_cb, (void *) ctx);
+	if (event_hndl < 0) {
+		D("Failed to register event cb\n");
+		return -1;
+	}
+
+	g_main_loop_run(mainloop);
+
+	ret = vsm_del_state_changed_callback(ctx, state_hndl);
+	if (ret != VSM_ERROR_NONE) {
+		D("Failed to deregister state changed callback\n");
+	}
+
+	ret = vsm_del_event_callback(ctx, event_hndl);
+	if (ret != VSM_ERROR_NONE) {
+		D("Failed to deregister event callback\n");
+	}
+
+	/* Cleanup context in vsm_context */
+	vsm_cleanup_context(ctx);
+
+	return 0;
+}
+
+static void create_zone_check_thread() {
+	sdb_thread_t t;
+	if (sdb_thread_create(&t, zone_check_thread, NULL)) {
+		D("cannot create_zone_check_thread.\n");
+		return;
+	}
+	D("created zone_check_thread\n");
+}
+
+/* default plugin proc */
+static int get_plugin_capability(const char* in_buf, sdbd_plugin_param out) {
+    int ret = SDBD_PLUGIN_RET_NOT_SUPPORT;
+
+    if (in_buf == NULL) {
+        D("Invalid argument\n");
+        return SDBD_PLUGIN_RET_FAIL;
+    }
+
+    if (SDBD_CMP_CAP(in_buf, SECURE)) {
+        snprintf(out.data, out.len, "%s", SDBD_CAP_RET_DISABLED);
+        ret = SDBD_PLUGIN_RET_SUCCESS;
+    } else if (SDBD_CMP_CAP(in_buf, INTER_SHELL)) {
+        snprintf(out.data, out.len, "%s", SDBD_CAP_RET_ENABLED);
+        ret = SDBD_PLUGIN_RET_SUCCESS;
+    } else if (SDBD_CMP_CAP(in_buf, FILESYNC)) {
+        // - push : SDBD_CAP_RET_PUSH
+        // - pull : SDBD_CAP_RET_PULL
+        // - both : SDBD_CAP_RET_PUSHPULL
+        // - disabled : SDBD_CAP_RET_DISABLED
+        snprintf(out.data, out.len, "%s", SDBD_CAP_RET_PUSHPULL);
+        ret = SDBD_PLUGIN_RET_SUCCESS;
+    } else if (SDBD_CMP_CAP(in_buf, USBPROTO)) {
+        if (is_emulator()) {
+            snprintf(out.data, out.len, "%s", SDBD_CAP_RET_DISABLED);
+        } else {
+            snprintf(out.data, out.len, "%s", SDBD_CAP_RET_ENABLED);
+        }
+        ret = SDBD_PLUGIN_RET_SUCCESS;
+    } else if (SDBD_CMP_CAP(in_buf, SOCKPROTO)) {
+        if (is_emulator()) {
+            snprintf(out.data, out.len, "%s", SDBD_CAP_RET_ENABLED);
+        } else {
+            snprintf(out.data, out.len, "%s", SDBD_CAP_RET_DISABLED);
+        }
+        ret = SDBD_PLUGIN_RET_SUCCESS;
+    } else if (SDBD_CMP_CAP(in_buf, ROOTONOFF)) {
+        if (access("/bin/su", F_OK) == 0) {
+            snprintf(out.data, out.len, "%s", SDBD_CAP_RET_ENABLED);
+        } else {
+            snprintf(out.data, out.len, "%s", SDBD_CAP_RET_DISABLED);
+        }
+    } else if (SDBD_CMP_CAP(in_buf, PLUGIN_VER)) {
+        snprintf(out.data, out.len, "%s", UNKNOWN);
+        ret = SDBD_PLUGIN_RET_SUCCESS;
+    } else if (SDBD_CMP_CAP(in_buf, PRODUCT_VER)) {
+        snprintf(out.data, out.len, "%s", UNKNOWN);
+        ret = SDBD_PLUGIN_RET_SUCCESS;
+    }
+
+    return ret;
+}
+
+static int verify_shell_cmd(const char* in_buf, sdbd_plugin_param out) {
+    int ret = SDBD_PLUGIN_RET_FAIL;
+
+    if (in_buf == NULL) {
+        D("Invalid argument\n");
+        return SDBD_PLUGIN_RET_FAIL;
+    }
+
+    D("shell command : %s\n", in_buf);
+
+    snprintf(out.data, out.len, "%s", SDBD_RET_VALID);
+    ret = SDBD_PLUGIN_RET_SUCCESS;
+
+    return ret;
+}
+
+static int convert_shell_cmd(const char* in_buf, sdbd_plugin_param out) {
+    int ret = SDBD_PLUGIN_RET_FAIL;
+
+    if (in_buf == NULL) {
+        D("Invalid argument\n");
+        return SDBD_PLUGIN_RET_FAIL;
+    }
+
+    snprintf(out.data, out.len, "%s", in_buf);
+    ret = SDBD_PLUGIN_RET_SUCCESS;
+
+    return ret;
+}
+
+static int verify_peer_ip(const char* in_buf, sdbd_plugin_param out) {
+    int ret = SDBD_PLUGIN_RET_FAIL;
+
+    if (in_buf == NULL) {
+        D("Invalid argument\n");
+        return SDBD_PLUGIN_RET_FAIL;
+    }
+
+    D("peer ip : %s\n", in_buf);
+
+    snprintf(out.data, out.len, "%s", SDBD_RET_VALID);
+    ret = SDBD_PLUGIN_RET_SUCCESS;
+
+    return ret;
+}
+
+static int verify_sdbd_launch(const char* in_buf, sdbd_plugin_param out) {
+    snprintf(out.data, out.len, "%s", SDBD_RET_VALID);
+    return SDBD_PLUGIN_RET_SUCCESS;
+}
+
+static int verify_root_cmd(const char* in_buf, sdbd_plugin_param out) {
+    int ret = SDBD_PLUGIN_RET_FAIL;
+
+    if (in_buf == NULL) {
+        D("Invalid argument\n");
+        return SDBD_PLUGIN_RET_FAIL;
+    }
+
+    D("shell command : %s\n", in_buf);
+
+    if (verify_root_commands(in_buf)) {
+        snprintf(out.data, out.len, "%s", SDBD_RET_VALID);
+    } else {
+        snprintf(out.data, out.len, "%s", SDBD_RET_INVALID);
+    }
+    ret = SDBD_PLUGIN_RET_SUCCESS;
+
+    return ret;
+}
+
+int default_cmd_proc(const char* cmd,
+                    const char* in_buf, sdbd_plugin_param out) {
+    int ret = SDBD_PLUGIN_RET_NOT_SUPPORT;
+
+    /* Check the arguments */
+    if (cmd == NULL || out.data == NULL) {
+        D("Invalid argument\n");
+        return SDBD_PLUGIN_RET_FAIL;
+    }
+
+    D("handle the command : %s\n", cmd);
+
+    /* Handle the request from sdbd */
+    if (SDBD_CMP_CMD(cmd, PLUGIN_CAP)) {
+        ret = get_plugin_capability(in_buf, out);
+    } else if (SDBD_CMP_CMD(cmd, VERIFY_SHELLCMD)) {
+        ret = verify_shell_cmd(in_buf, out);
+    } else if (SDBD_CMP_CMD(cmd, CONV_SHELLCMD)) {
+        ret = convert_shell_cmd(in_buf, out);
+    } else if (SDBD_CMP_CMD(cmd, VERIFY_PEERIP)) {
+        ret = verify_peer_ip(in_buf, out);
+    } else if (SDBD_CMP_CMD(cmd, VERIFY_LAUNCH)) {
+        ret = verify_sdbd_launch(in_buf, out);
+    } else if (SDBD_CMP_CMD(cmd, VERIFY_ROOTCMD)) {
+        ret = verify_root_cmd(in_buf, out);
+    } else {
+        D("Not supported command : %s\n", cmd);
+        ret = SDBD_PLUGIN_RET_NOT_SUPPORT;
+    }
+
+    return ret;
+}
+
+int request_plugin_cmd(const char* cmd, const char* in_buf,
+                        char *out_buf, unsigned int out_len)
+{
+    int ret = SDBD_PLUGIN_RET_FAIL;
+    sdbd_plugin_param out;
+
+    if (out_len > SDBD_PLUGIN_OUTBUF_MAX) {
+        D("invalid parameter : %s\n", cmd);
+        return 0;
+    }
+
+    out.data = out_buf;
+    out.len = out_len;
+
+    ret = sdbd_plugin_cmd_proc(cmd, in_buf, out);
+    if (ret == SDBD_PLUGIN_RET_FAIL) {
+        D("failed to request : %s\n", cmd);
+        return 0;
+    }
+    if (ret == SDBD_PLUGIN_RET_NOT_SUPPORT) {
+        // retry in default handler
+        ret = default_cmd_proc(cmd, in_buf, out);
+        if (ret == SDBD_PLUGIN_RET_FAIL) {
+            D("failed to request : %s\n", cmd);
+            return 0;
+        }
+    }
+
+    // add null character.
+    out_buf[out_len-1] = '\0';
+    D("return value: %s\n", out_buf);
+
+    return 1;
+}
+
+static void load_sdbd_plugin() {
+    sdbd_plugin_cmd_proc = NULL;
+
+    g_sdbd_plugin_handle = dlopen(SDBD_PLUGIN_PATH, RTLD_NOW);
+    if (!g_sdbd_plugin_handle) {
+        D("failed to dlopen(%s). error: %s\n", SDBD_PLUGIN_PATH, dlerror());
+        sdbd_plugin_cmd_proc = default_cmd_proc;
         return;
     }
-    if (st.st_uid != SID_DEVELOPER || st.st_gid != SID_DEVELOPER) {
-        char *arg_list[] = {"/bin/chown", ONDEMAND_ROOT_PATH, "-R", NULL};
 
-        spawn("/bin/chown", arg_list);
+    sdbd_plugin_cmd_proc = dlsym(g_sdbd_plugin_handle, SDBD_PLUGIN_INTF);
+    if (!sdbd_plugin_cmd_proc) {
+        D("failed to get the sdbd plugin interface. error: %s\n", dlerror());
+        dlclose(g_sdbd_plugin_handle);
+        g_sdbd_plugin_handle = NULL;
+        sdbd_plugin_cmd_proc = default_cmd_proc;
+        return;
     }
+
+    D("using sdbd plugin interface.(%s)\n", SDBD_PLUGIN_PATH);
+}
+
+static void init_sdk_requirements() {
+    struct stat st;
 
     execute_required_process();
 
     register_pwlock_cb();
+
+    if (is_emulator()) {
+        register_bootdone_cb();
+    }
+}
+
+int request_plugin_verification(const char* cmd, const char* in_buf) {
+    char out_buf[32] = {0,};
+
+    if(!request_plugin_cmd(cmd, in_buf, out_buf, sizeof(out_buf))) {
+        D("failed to request plugin command. : %s\n", SDBD_CMD_VERIFY_LAUNCH);
+        return 0;
+    }
+
+    if (strlen(out_buf) == 7 && !strncmp(out_buf, SDBD_RET_INVALID, 7)) {
+        D("[%s] is NOT verified.\n", cmd);
+        return 0;
+    }
+
+    D("[%s] is verified.\n", cmd);
+    return 1;
+}
+
+static char* get_cpu_architecture()
+{
+    int ret = 0;
+    bool b_value = false;
+
+    ret = system_info_get_platform_bool(
+            "http://tizen.org/feature/platform.core.cpu.arch.armv6", &b_value);
+    if (ret == SYSTEM_INFO_ERROR_NONE && b_value) {
+        return CPUARCH_ARMV6;
+    }
+
+    ret = system_info_get_platform_bool(
+            "http://tizen.org/feature/platform.core.cpu.arch.armv7", &b_value);
+    if (ret == SYSTEM_INFO_ERROR_NONE && b_value) {
+        return CPUARCH_ARMV7;
+    }
+
+    ret = system_info_get_platform_bool(
+            "http://tizen.org/feature/platform.core.cpu.arch.x86", &b_value);
+    if (ret == SYSTEM_INFO_ERROR_NONE && b_value) {
+        return CPUARCH_X86;
+    }
+
+    D("fail to get the CPU architecture of model:%d\n", errno);
+    return UNKNOWN;
+}
+
+static void init_capabilities(void) {
+    int ret = -1;
+    char *value = NULL;
+
+    memset(&g_capabilities, 0, sizeof(g_capabilities));
+
+    // CPU Architecture of model
+    snprintf(g_capabilities.cpu_arch, sizeof(g_capabilities.cpu_arch),
+                "%s", get_cpu_architecture());
+
+
+    // Secure protocol support
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_SECURE,
+                            g_capabilities.secure_protocol,
+                            sizeof(g_capabilities.secure_protocol))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_SECURE);
+        snprintf(g_capabilities.secure_protocol, sizeof(g_capabilities.secure_protocol),
+                    "%s", DISABLED);
+    }
+
+
+    // Interactive shell support
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_INTER_SHELL,
+                            g_capabilities.intershell_support,
+                            sizeof(g_capabilities.intershell_support))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_INTER_SHELL);
+        snprintf(g_capabilities.intershell_support, sizeof(g_capabilities.intershell_support),
+                    "%s", DISABLED);
+    }
+
+
+    // File push/pull support
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_FILESYNC,
+                            g_capabilities.filesync_support,
+                            sizeof(g_capabilities.filesync_support))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_FILESYNC);
+        snprintf(g_capabilities.filesync_support, sizeof(g_capabilities.filesync_support),
+                    "%s", DISABLED);
+    }
+
+
+    // USB protocol support
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_USBPROTO,
+                            g_capabilities.usbproto_support,
+                            sizeof(g_capabilities.usbproto_support))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_USBPROTO);
+        snprintf(g_capabilities.usbproto_support, sizeof(g_capabilities.usbproto_support),
+                    "%s", DISABLED);
+    }
+
+
+    // Socket protocol support
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_SOCKPROTO,
+                            g_capabilities.sockproto_support,
+                            sizeof(g_capabilities.sockproto_support))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_SOCKPROTO);
+        snprintf(g_capabilities.sockproto_support, sizeof(g_capabilities.sockproto_support),
+                    "%s", DISABLED);
+    }
+
+
+    // Root command support
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_ROOTONOFF,
+                            g_capabilities.rootonoff_support,
+                            sizeof(g_capabilities.rootonoff_support))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_ROOTONOFF);
+        snprintf(g_capabilities.rootonoff_support, sizeof(g_capabilities.rootonoff_support),
+                    "%s", DISABLED);
+    }
+
+
+    // Zone support
+    ret = is_container_enabled();
+    snprintf(g_capabilities.zone_support, sizeof(g_capabilities.zone_support),
+                "%s", ret == 1 ? ENABLED : DISABLED);
+
+
+    // Multi-User support
+    // TODO: get this information from platform.
+    snprintf(g_capabilities.multiuser_support, sizeof(g_capabilities.multiuser_support),
+                "%s", DISABLED);
+
+
+    // Window size synchronization support
+    snprintf(g_capabilities.syncwinsz_support, sizeof(g_capabilities.syncwinsz_support),
+                "%s", ENABLED);
+
+
+    // Profile name
+    ret = system_info_get_platform_string("http://tizen.org/feature/profile", &value);
+    if (ret != SYSTEM_INFO_ERROR_NONE) {
+        snprintf(g_capabilities.profile_name, sizeof(g_capabilities.profile_name),
+                    "%s", UNKNOWN);
+        D("fail to get profile name:%d\n", errno);
+    } else {
+        snprintf(g_capabilities.profile_name, sizeof(g_capabilities.profile_name),
+                    "%s", value);
+        if (value != NULL) {
+            free(value);
+        }
+    }
+
+
+    // Vendor name
+    ret = system_info_get_platform_string("http://tizen.org/system/manufacturer", &value);
+    if (ret != SYSTEM_INFO_ERROR_NONE) {
+        snprintf(g_capabilities.vendor_name, sizeof(g_capabilities.vendor_name),
+                    "%s", UNKNOWN);
+        D("fail to get the Vendor name:%d\n", errno);
+    } else {
+        snprintf(g_capabilities.vendor_name, sizeof(g_capabilities.vendor_name),
+                    "%s", value);
+        if (value != NULL) {
+            free(value);
+        }
+    }
+
+
+    // Platform version
+    ret = system_info_get_platform_string("http://tizen.org/feature/platform.version", &value);
+    if (ret != SYSTEM_INFO_ERROR_NONE) {
+        snprintf(g_capabilities.platform_version, sizeof(g_capabilities.platform_version),
+                    "%s", UNKNOWN);
+        D("fail to get platform version:%d\n", errno);
+    } else {
+        snprintf(g_capabilities.platform_version, sizeof(g_capabilities.platform_version),
+                    "%s", value);
+        if (value != NULL) {
+            free(value);
+        }
+    }
+
+
+    // Product version
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_PRODUCT_VER,
+                            g_capabilities.product_version,
+                            sizeof(g_capabilities.product_version))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_PRODUCT_VER);
+        snprintf(g_capabilities.product_version, sizeof(g_capabilities.product_version),
+                    "%s", UNKNOWN);
+    }
+
+
+    // Sdbd version
+    snprintf(g_capabilities.sdbd_version, sizeof(g_capabilities.sdbd_version),
+                "%d.%d.%d", SDB_VERSION_MAJOR, SDB_VERSION_MINOR, SDB_VERSION_PATCH);
+
+
+    // Sdbd plugin version
+    if(!request_plugin_cmd(SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_PLUGIN_VER,
+                            g_capabilities.sdbd_plugin_version,
+                            sizeof(g_capabilities.sdbd_plugin_version))) {
+        D("failed to request. (%s:%s) \n", SDBD_CMD_PLUGIN_CAP, SDBD_CAP_TYPE_PLUGIN_VER);
+        snprintf(g_capabilities.sdbd_plugin_version, sizeof(g_capabilities.sdbd_plugin_version),
+                    "%s", UNKNOWN);
+    }
 }
 #endif /* !SDB_HOST */
+
+static int is_support_usbproto()
+{
+    return (!strncmp(g_capabilities.usbproto_support, SDBD_CAP_RET_ENABLED, strlen(SDBD_CAP_RET_ENABLED)));
+}
+
+static int is_support_sockproto()
+{
+    return (!strncmp(g_capabilities.sockproto_support, SDBD_CAP_RET_ENABLED, strlen(SDBD_CAP_RET_ENABLED)));
+}
 
 int sdb_main(int is_daemon, int server_port)
 {
 #if !SDB_HOST
+    load_sdbd_plugin();
+    init_capabilities();
+
     init_drop_privileges();
     init_sdk_requirements();
+    if (!request_plugin_verification(SDBD_CMD_VERIFY_LAUNCH, NULL)) {
+        D("sdbd should be launched in develop mode.\n");
+        return -1;
+    }
+
     umask(000);
 #endif
 
@@ -1325,18 +2120,64 @@ int sdb_main(int is_daemon, int server_port)
         char local_name[30];
         build_local_name(local_name, sizeof(local_name), server_port);
         if(install_listener(local_name, "*smartsocket*", NULL)) {
-            D("Cannot install listener (smartsocket)\n");
-            return 1;
-            //exit(1);
+            exit(1);
         }
     }
 
-    if (!is_emulator()) {
+    hostshell_mode = 1;
+
+ /* Not support zone feature yet */
+ /*
+	if (is_container_enabled()) {
+		D("container feature permitted\n");
+
+		// register call-back to check state of zone
+		create_zone_check_thread();
+
+		// check if zone is started before sdbd, in the case sdbd does not get notified.
+		char** zone_list;
+		zone_list = get_zone_list();
+		if (zone_list != NULL) {
+			D("set zone mode on\n");
+			sdb_mutex_lock(&zone_check_lock);
+			if(!initial_zone_mode_check) {
+				initial_zone_mode_check = 1;
+				hostshell_mode = 0;
+				// execute processes needed by each zone
+				if (zone_list) {
+					int i;
+					for (i = 0; *(zone_list + i); i++) {
+						D("Name of zone which executes required processes (in sdb_main) : %s \n", *(zone_list + i));
+						// if zone name has prefix as '/', remove it
+						if (!strncmp(*(zone_list + i), "\/", 1)) {
+							execute_required_process_in_each_zone(
+									(*(zone_list + i) + 1));
+						} else {
+							execute_required_process_in_each_zone(*(zone_list + i));
+						}
+						free(*(zone_list + i));
+					}
+					free(zone_list);
+				}
+			}
+			sdb_mutex_unlock(&zone_check_lock);
+		} else {
+			D("not found any zone yet, denied mode on\n");
+			sdb_sleep_ms(500);
+		}
+	} else {
+		D("container feature not permitted, set host mode on\n");
+		initial_zone_mode_check = 1;
+		hostshell_mode = 1;
+	}
+*/
+    if (is_support_usbproto()) {
         // listen on USB
         usb_init();
         // listen on tcp
         //local_init(DEFAULT_SDB_LOCAL_TRANSPORT_PORT);
-    } else {
+    }
+    if (is_support_sockproto()){
         // listen on default port
         local_init(DEFAULT_SDB_LOCAL_TRANSPORT_PORT);
     }
@@ -1484,16 +2325,12 @@ int copy_packet(apacket* dest, apacket* src) {
     dest->ptr = src->ptr;
     dest->len = src->len;
 
-    memcpy(&(dest->msg), &(src->msg), sizeof(amessage));
-    // TODO: should verify what if data length is over MAX_PAYLOAD
     int data_length = src->msg.data_length;
     if(data_length > MAX_PAYLOAD) {
         data_length = MAX_PAYLOAD;
-        dest->msg.data_length = data_length;
-        D("copy packet error: %d > MAX_PAYLOAD\n", src->msg.data_length);
     }
+    memcpy(&(dest->msg), &(src->msg), sizeof(amessage) + data_length);
 
-    memcpy(&(dest->data), &(src->data), data_length);
     return 0;
 }
 
@@ -1714,7 +2551,7 @@ int main(int argc, char **argv)
 #endif
 #if !SDB_HOST
     if (daemonize() < 0)
-        fatal("daemonize() failed: (errno:%d)", errno);
+        fatal("daemonize() failed: errno:%d", errno);
 #endif
 
     start_device_log();

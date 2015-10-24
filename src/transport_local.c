@@ -139,9 +139,7 @@ int local_connect_arbitrary_ports(int console_port, int sdb_port, const char *de
         if (close_on_exec(fd) < 0) {
             D("failed to close fd exec\n");
         }
-        if (disable_tcp_nagle(fd) < 0) {
-            D("failed to disable_tcp_nagle\n");
-        }
+        disable_tcp_nagle(fd);
         snprintf(buf, sizeof buf, "%s%d", LOCAL_CLIENT_PREFIX, console_port);
         register_socket_transport(fd, buf, sdb_port, 1, device_name);
         return 0;
@@ -165,7 +163,7 @@ int get_devicename_from_shdmem(int port, char *device_name)
 
     if (shared_memory == (void *)-1)
     {
-        D("faild to get shdmem key (%d) : %s\n", port, strerror(errno));
+        D("faild to get shdmem key (%d) : errno:%d\n", port, errno);
         return -1;
     }
 
@@ -251,7 +249,7 @@ static void *client_socket_thread(void *x)
 static void *server_socket_thread(void * arg)
 {
     int serverfd, fd;
-    struct sockaddr addr;
+    struct sockaddr_in addr;
     socklen_t alen;
     int port = (int)arg;
 
@@ -279,16 +277,21 @@ static void *server_socket_thread(void * arg)
             pthread_cond_broadcast(&noti_cond);
         }
 
-        fd = sdb_socket_accept(serverfd, &addr, &alen);
+        fd = sdb_socket_accept(serverfd, (struct sockaddr *)&addr, &alen);
         if(fd >= 0) {
             D("server: new connection on fd %d\n", fd);
             if (close_on_exec(fd) < 0) {
                 D("failed to close fd exec\n");
             }
-            if (disable_tcp_nagle(fd) < 0) {
-                D("failed to disable_tcp_nagle\n");
+            disable_tcp_nagle(fd);
+
+            // Check the peer ip validation.
+            if (!is_emulator()
+                && !request_plugin_verification(SDBD_CMD_VERIFY_PEERIP, inet_ntoa(addr.sin_addr))) {
+                sdb_close(fd);
+            } else {
+                register_socket_transport(fd, "host", port, 1, NULL);
             }
-            register_socket_transport(fd, "host", port, 1, NULL);
         }
     }
     D("transport: server_socket_thread() exiting\n");
@@ -417,8 +420,8 @@ int connect_nonb(int sockfd, const struct sockaddr *saptr, socklen_t salen,
 
     flags = fcntl(sockfd, F_GETFL, 0);
     if(fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        D("failed to set file O_NONBLOCK status flag for socket %d: %s\n",
-                     sockfd, strerror(errno));
+        D("failed to set file O_NONBLOCK status flag for socket %d: errno:%d\n",
+                     sockfd, errno);
     }
 
     error = 0;
@@ -452,8 +455,8 @@ int connect_nonb(int sockfd, const struct sockaddr *saptr, socklen_t salen,
 
     done:
     if(fcntl(sockfd, F_SETFL, flags) == -1) { /* restore file status flags */
-        D("failed to restore file status flag for socket %d: (errno:%d)\n",
-                 sockfd, errno);
+        D("failed to restore file status flag for socket %d\n",
+                 sockfd);
     }
 
     if (error) {
@@ -464,16 +467,16 @@ int connect_nonb(int sockfd, const struct sockaddr *saptr, socklen_t salen,
     return (0);
 }
 
-static int send_msg_to_localhost_from_guest(int local_port, char *request, int sock_type) {
+static int send_msg_to_localhost_from_guest(const char *host_ip, int local_port, char *request, int sock_type) {
     int                  ret, s;
     struct sockaddr_in   server;
     int connect_timeout = 1;
     memset( &server, 0, sizeof(server) );
     server.sin_family      = AF_INET;
     server.sin_port        = htons(local_port);
-    server.sin_addr.s_addr = inet_addr(QEMU_FORWARD_IP);
+    server.sin_addr.s_addr = inet_addr(host_ip);
 
-    D("try to send notification to host(%s:%d) using %s:[%s]\n", QEMU_FORWARD_IP, local_port, (sock_type == 0) ? "tcp" : "udp", request);
+    D("try to send notification to host(%s:%d) using %s:[%s]\n", host_ip, local_port, (sock_type == 0) ? "tcp" : "udp", request);
 
     if (sock_type == 0) {
         s = socket(AF_INET, SOCK_STREAM, 0);
@@ -490,7 +493,6 @@ static int send_msg_to_localhost_from_guest(int local_port, char *request, int s
         sdb_close(s);
         return -1;
     }
-    // writex handles EINTR and returns 0 if success
     if (writex(s, request, strlen(request)) != 0) {
         D("could not send notification request to host\n");
         sdb_close(s);
@@ -502,6 +504,7 @@ static int send_msg_to_localhost_from_guest(int local_port, char *request, int s
     return 0;
 }
 
+/*
 static void notify_sdbd_startup() {
     char                 buffer[512];
     char                 request[512];
@@ -538,6 +541,7 @@ static void notify_sdbd_startup() {
         sleep(1);
     }
 }
+*/
 
 // send the "emulator" request to sdbserver
 static void notify_sdbd_startup_thread() {
@@ -545,52 +549,60 @@ static void notify_sdbd_startup_thread() {
     char                 request[512];
 
     char vm_name[256]={0,};
+    char host_ip[256] = {0,};
+    char guest_ip[256] = {0,};
     int base_port = get_emulator_forward_port();
     int r = get_emulator_name(vm_name, sizeof vm_name);
     int time = 0;
-    int try_limit_time = -1; // try_limit_time < 0 if unlimited
+    //int try_limit_time = -1; // try_limit_time < 0 if unlimited
     if (base_port < 0 || r < 0) {
         return;
     }
-
+    if (get_emulator_hostip(host_ip, sizeof host_ip) == -1) {
+       D("failed to get emulator host ip\n");
+       return;
+    }
     // XXX: Known issue - log collision
     while (1) {
-        /* XXX: Known issue - timing issue
-        A request failure can happen at the starting up of a SDB server
-        (with very little probability)
-        If a SDB server establish a new connection and send a request
-        between D1 and D2, the request will fail.
-        Becuase when a SDB server gets a duplicated "emulator:" command,
-        it closes the existing transport connection.
-        */
-
-        // If there is any connected (via TCP/IP) SDB server, sleep 10 secs (D1)
+        // Trial limitation reached. terminate notify thread.
+        /*if (0 <= try_limit_time && try_limit_time <= time) {
+            break;
+        }*/
+        // If there is any connected (via TCP/IP) SDB server, sleep 10 secs
         if (get_connected_count(kTransportLocal) > 0) {
             if (time >= 0) {
                 time = 0;
-                D("notify_sdbd_startup() success after %d trial(s)", time);
+                D("notify_sdbd_startup() success after %d trial(s)\n", time);
             }
             sleep(10);
             continue;
         }
 
+        if (get_emulator_guestip(guest_ip, sizeof guest_ip) == -1) {
+			D("failed to get emulator guest ip\n");
+			goto sleep_and_continue;
+		}
+
         // tell qemu sdbd is just started with udp
-        if (send_msg_to_localhost_from_guest(base_port + 3, "2\n", 1) < 0) {
+        if (send_msg_to_localhost_from_guest(host_ip, base_port + 3, "2\n", 1) < 0) {
             D("could not send sensord noti request, try again %dth\n", time+1);
             goto sleep_and_continue;
         }
 
-        // tell sdb server emulator's vms name (D2)
-        snprintf(request, sizeof request, "host:emulator:%d:%s",base_port + 1, vm_name);
+        // tell sdb server emulator's vms name
+        // TODO: should we use host:emulator request? let's talk about this!
+
+        if (!strncmp(host_ip, QEMU_FORWARD_IP, sizeof host_ip)) {
+            snprintf(request, sizeof request, "host:emulator:%d:%s",base_port + 1, vm_name);
+        } else {
+            snprintf(request, sizeof request, "host:connect:%s:%d", guest_ip, DEFAULT_SDB_LOCAL_TRANSPORT_PORT);
+        }
         snprintf(buffer, sizeof buffer, "%04x%s", strlen(request), request );
 
-        if (get_connected_count(kTransportLocal) > 0) continue; // See comment above
-
-        if (send_msg_to_localhost_from_guest(DEFAULT_SDB_PORT, buffer, 0) <0) {
+        if (send_msg_to_localhost_from_guest(host_ip, DEFAULT_SDB_PORT, buffer, 0) <0) {
             D("could not send sdbd noti request. it might sdb server has not been started yet.\n");
             goto sleep_and_continue;
         }
-        
         //LOGI("sdbd noti request sent.\n");
 
 sleep_and_continue:
@@ -645,7 +657,7 @@ void local_init(int port)
         // thread start
         if(sdb_thread_create(&thr, notify_sdbd_startup_thread, NULL)) {
             fatal("cannot create notify_sdbd_startup_thread");
-            notify_sdbd_startup(); // defensive code
+            //notify_sdbd_startup(); // defensive code
         }
         sdb_mutex_unlock(&register_noti_lock);
     }
